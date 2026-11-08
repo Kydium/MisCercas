@@ -1,3 +1,4 @@
+mod desk;
 mod icons;
 mod store;
 
@@ -13,10 +14,11 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 pub struct AppState {
     dir: PathBuf,
+    desktop: Option<PathBuf>,
     data: Mutex<store::Data>,
     dirty: AtomicBool,
     icons: Mutex<HashMap<String, Option<String>>>,
-    all_hidden: AtomicBool,
+    pub(crate) all_hidden: AtomicBool,
 }
 
 impl AppState {
@@ -25,7 +27,11 @@ impl AppState {
     }
     fn flush(&self) {
         if self.dirty.swap(false, Ordering::SeqCst) {
-            let copy = self.data.lock().unwrap().clone();
+            let copy = {
+                let mut d = self.data.lock().unwrap();
+                desk::sync(&mut d, self.desktop.clone());
+                d.clone()
+            };
             if let Err(e) = store::save(&self.dir, &copy) {
                 eprintln!("No se pudo guardar la configuración: {e}");
             }
@@ -99,7 +105,7 @@ fn create_fence_window(app: &AppHandle, f: &store::Fence, keep_on_top: bool) {
     }
 }
 
-fn fence_windows(app: &AppHandle) -> Vec<tauri::WebviewWindow> {
+pub(crate) fn fence_windows(app: &AppHandle) -> Vec<tauri::WebviewWindow> {
     app.webview_windows().into_iter().filter(|(k, _)| k.starts_with("fence-")).map(|(_, w)| w).collect()
 }
 
@@ -392,9 +398,59 @@ fn item_menu() -> Option<String> {
 fn item_transfer() -> bool {
     false
 }
+
+/// Se soltó un elemento fuera de su cerca: pasa a otra cerca si el cursor está sobre una, o sale de la cerca.
 #[tauri::command]
-fn item_release() -> Option<String> {
-    None
+fn item_release(app: AppHandle, state: State<AppState>, id: String, args: Option<Value>) -> Option<String> {
+    let path = args.as_ref()?.get("path")?.as_str()?.to_string();
+    let cur = app.cursor_position().ok()?;
+    let mut target: Option<String> = None;
+    for w in fence_windows(&app) {
+        if !w.is_visible().unwrap_or(false) {
+            continue;
+        }
+        let (Ok(p), Ok(s)) = (w.outer_position(), w.outer_size()) else { continue };
+        if cur.x >= p.x as f64 && cur.x < (p.x + s.width as i32) as f64 && cur.y >= p.y as f64 && cur.y < (p.y + s.height as i32) as f64 {
+            let wid = w.label().trim_start_matches("fence-").to_string();
+            if wid == id {
+                return None; // cayó sobre su propia cerca
+            }
+            target = Some(wid);
+            break;
+        }
+    }
+    let k = key(&path);
+    let result;
+    {
+        let mut d = state.data.lock().unwrap();
+        let hide = d.settings.hide_desktop;
+        let dirs = desk::desktop_dirs(state.desktop.clone());
+        let Some(src) = d.fences.iter().position(|f| f.id == id) else { return None };
+        if d.fences[src].portal.is_some() {
+            return None;
+        }
+        let Some(i) = d.fences[src].items.iter().position(|it| key(&it.p) == k) else { return None };
+        if let Some(t) = &target {
+            let Some(ti) = d.fences.iter().position(|f| &f.id == t) else { return None };
+            if d.fences[ti].portal.is_some() {
+                return None;
+            }
+            let item = d.fences[src].items.remove(i);
+            if !d.fences[ti].items.iter().any(|it| key(&it.p) == k) {
+                d.fences[ti].items.push(item);
+            }
+            result = "moved".to_string();
+        } else {
+            d.fences[src].items.remove(i);
+            result = if hide && desk::in_desktop(&path, &dirs) { "desktop".into() } else { "removed".to_string() };
+        }
+    }
+    state.touch();
+    let _ = app.emit("reload", json!({ "id": id }));
+    if let Some(t) = target {
+        let _ = app.emit("reload", json!({ "id": t }));
+    }
+    Some(result)
 }
 
 /* ---------- arranque ---------- */
@@ -459,8 +515,10 @@ pub fn run() {
             let keep = data.settings.keep_on_top;
             let hotkey = data.settings.hotkey.clone();
             let fences = data.fences.clone();
+            let desktop = handle.path().desktop_dir().ok();
             app.manage(AppState {
                 dir,
+                desktop,
                 data: Mutex::new(data),
                 dirty: AtomicBool::new(true),
                 icons: Mutex::new(HashMap::new()),
@@ -470,6 +528,7 @@ pub fn run() {
                 create_fence_window(&handle, f, keep);
             }
             build_tray(&handle)?;
+            desk::guard::start(handle.clone());
             if let Err(e) = handle.global_shortcut().register(hotkey.as_str()) {
                 eprintln!("No se pudo registrar el atajo {hotkey}: {e}");
             }

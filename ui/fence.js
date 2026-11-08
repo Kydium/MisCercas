@@ -138,7 +138,7 @@
     el.className = `item${en.missing ? ' missing' : ''}`;
     el.dataset.i = String(i);
     el.title = en.missing ? `No se encontró: ${en.path}` : en.path;
-    el.draggable = !S.fence.portal && S.fence.sort === 'manual';
+    el.draggable = false;
     const img = document.createElement('img');
     img.className = 'ico';
     img.alt = '';
@@ -416,6 +416,76 @@
     itemsEl.querySelectorAll('.dragging').forEach((el) => el.classList.remove('dragging'));
     clearDropMarks();
   });
+
+  /* Arrastre con el puntero (en Tauri no funciona el arrastrar y soltar de HTML5 entre ventanas) */
+  let pd = null;
+  let justDragged = false;
+  function itemAt(x, y) {
+    const t = document.elementFromPoint(x, y);
+    return t && t.closest ? t.closest('.item') : null;
+  }
+  function insertionAt(x, y) {
+    const el = itemAt(x, y);
+    if (!el) return { index: entries.length, el: null, after: true };
+    const i = Number(el.dataset.i);
+    const r = el.getBoundingClientRect();
+    const after = S.fence.view === 'list' ? y > r.top + r.height / 2 : x > r.left + r.width / 2;
+    return { index: after ? i + 1 : i, el, after };
+  }
+  itemsEl.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || !S || S.fence.portal) return;
+    const el = e.target.closest('.item');
+    if (!el) return;
+    const en = entries[Number(el.dataset.i)];
+    if (!en || en.src < 0) return;
+    pd = { el, en, x: e.clientX, y: e.clientY, active: false, ghost: null, id: e.pointerId };
+  });
+  document.addEventListener('pointermove', (e) => {
+    if (!pd) return;
+    if (!pd.active) {
+      if (Math.hypot(e.clientX - pd.x, e.clientY - pd.y) < 6) return;
+      pd.active = true;
+      try { pd.el.setPointerCapture(pd.id); } catch { /* sin captura */ }
+      pd.el.classList.add('dragging');
+      const g = pd.el.cloneNode(true);
+      g.style.cssText = `position:fixed;z-index:99;pointer-events:none;opacity:.85;width:${pd.el.offsetWidth}px;margin:0`;
+      document.body.appendChild(g);
+      pd.ghost = g;
+    }
+    pd.ghost.style.left = `${e.clientX - pd.el.offsetWidth / 2}px`;
+    pd.ghost.style.top = `${e.clientY - pd.el.offsetHeight / 2}px`;
+    clearDropMarks();
+    const inside = e.clientX >= 0 && e.clientY >= 0 && e.clientX < window.innerWidth && e.clientY < window.innerHeight;
+    if (inside && S.fence.sort === 'manual') {
+      const ins = insertionAt(e.clientX, e.clientY);
+      if (ins.el) ins.el.classList.add(ins.after ? 'drop-after' : 'drop-before');
+    }
+  });
+  async function endDrag(e) {
+    const d = pd;
+    pd = null;
+    if (!d || !d.active) return;
+    if (d.ghost) d.ghost.remove();
+    d.el.classList.remove('dragging');
+    clearDropMarks();
+    justDragged = true;
+    setTimeout(() => { justDragged = false; }, 50);
+    if (e.type === 'pointercancel') return;
+    const inside = e.clientX >= 0 && e.clientY >= 0 && e.clientX < window.innerWidth && e.clientY < window.innerHeight;
+    if (inside) {
+      if (S.fence.sort === 'manual') reorder(d.en.src, insertionAt(e.clientX, e.clientY).index);
+      else toast('Para reordenar, cambia el orden de la cerca a "Manual".');
+      return;
+    }
+    const r = await api.releaseItem({ path: d.en.path });
+    if (r === 'desktop') toast('Devuelto al Escritorio');
+    else if (r === 'removed') toast('Quitado de la cerca');
+    else if (r === 'moved') toast('Movido a otra cerca');
+  }
+  document.addEventListener('pointerup', endDrag);
+  document.addEventListener('pointercancel', endDrag);
+  itemsEl.addEventListener('click', (e) => { if (justDragged) { e.stopPropagation(); e.preventDefault(); } }, true);
+  itemsEl.addEventListener('dblclick', (e) => { if (justDragged) { e.stopPropagation(); e.preventDefault(); } }, true);
 
   document.addEventListener('dragover', (e) => {
     e.preventDefault(); // evita que Electron navegue al soltar un archivo fuera de la cerca
