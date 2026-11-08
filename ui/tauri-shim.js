@@ -39,6 +39,7 @@
     onReload: on('reload', true),
     onLayout: on('layout', true),
     onRenameTitle: on('rename-title', true),
+    onItemAction: on('item-action', true),
     onSettings: on('settings', false),
 
     settingsGet: async () => {

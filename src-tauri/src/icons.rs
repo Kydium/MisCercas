@@ -32,10 +32,8 @@ fn crop(w: u32, h: u32, rgba: Vec<u8>) -> (u32, u32, Vec<u8>) {
     }
     // se deja un cuadrado centrado para que todos los iconos tengan la misma proporción
     let side = (x1 - x0 + 1).max(y1 - y0 + 1);
-    let cx = (x0 + x1) / 2;
-    let cy = (y0 + y1) / 2;
-    let sx = cx.saturating_sub(side / 2).min(w.saturating_sub(side));
-    let sy = cy.saturating_sub(side / 2).min(h.saturating_sub(side));
+    let sx = x0.saturating_sub((side - (x1 - x0 + 1)) / 2).min(w.saturating_sub(side));
+    let sy = y0.saturating_sub((side - (y1 - y0 + 1)) / 2).min(h.saturating_sub(side));
     let side = side.min(w).min(h);
     let mut out = vec![0u8; (side * side * 4) as usize];
     for y in 0..side {

@@ -1,16 +1,37 @@
+mod align;
 mod desk;
 mod icons;
 mod store;
+mod sys;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use std::time::{Duration, Instant};
+use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, RunEvent, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Wry, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+/// Estado de ejecución de cada cerca (no se guarda).
+pub struct FState {
+    hover: bool,
+    last_inside: Instant,
+    menu_open: bool,
+    collapsed: bool,
+    ignore_until: Instant,
+    last_event: Option<Instant>,
+    prev: Option<align::B>,
+}
+
+impl FState {
+    fn new(collapsed: bool) -> Self {
+        let now = Instant::now();
+        FState { hover: false, last_inside: now, menu_open: false, collapsed, ignore_until: now, last_event: None, prev: None }
+    }
+}
 
 pub struct AppState {
     dir: PathBuf,
@@ -19,6 +40,7 @@ pub struct AppState {
     dirty: AtomicBool,
     icons: Mutex<HashMap<String, Option<String>>>,
     pub(crate) all_hidden: AtomicBool,
+    fs: Mutex<HashMap<String, FState>>,
 }
 
 impl AppState {
@@ -43,30 +65,214 @@ fn key(p: &str) -> String {
     if cfg!(windows) { p.replace('/', "\\").to_lowercase() } else { p.to_string() }
 }
 
+fn bg<F: FnOnce() + Send + 'static>(f: F) {
+    std::thread::spawn(f);
+}
+
 /* ---------- ventanas ---------- */
 fn label(id: &str) -> String {
     format!("fence-{id}")
 }
+fn id_of(label: &str) -> String {
+    label.trim_start_matches("fence-").to_string()
+}
+
+pub(crate) fn fence_windows(app: &AppHandle) -> Vec<WebviewWindow> {
+    app.webview_windows().into_iter().filter(|(k, _)| k.starts_with("fence-")).map(|(_, w)| w).collect()
+}
+
+fn fence_of(app: &AppHandle, id: &str) -> Option<store::Fence> {
+    app.state::<AppState>().data.lock().unwrap().fences.iter().find(|f| f.id == id).cloned()
+}
+
+fn with_fs<R>(app: &AppHandle, id: &str, f: impl FnOnce(&mut FState) -> R) -> R {
+    let st = app.state::<AppState>();
+    let collapsed = fence_of(app, id).map(|f| f.rolled).unwrap_or(false);
+    let mut m = st.fs.lock().unwrap();
+    f(m.entry(id.to_string()).or_insert_with(|| FState::new(collapsed)))
+}
+
+fn is_collapsed(f: &store::Fence, hover: bool) -> bool {
+    if f.auto_roll { !hover } else { f.rolled }
+}
+
+fn win_box(w: &WebviewWindow) -> Option<align::B> {
+    let sc = w.scale_factor().ok()?;
+    let p = w.outer_position().ok()?.to_logical::<f64>(sc);
+    let s = w.outer_size().ok()?.to_logical::<f64>(sc);
+    Some(align::B { id: id_of(w.label()), x: p.x.round() as i32, y: p.y.round() as i32, w: s.width.round() as i32, h: s.height.round() as i32 })
+}
+
+fn monitor_key(w: &WebviewWindow) -> Option<(i32, i32)> {
+    w.current_monitor().ok().flatten().map(|m| (m.position().x, m.position().y))
+}
+
+fn work_area(w: &WebviewWindow) -> align::Area {
+    if let Ok(Some(m)) = w.current_monitor() {
+        let sc = m.scale_factor();
+        let wa = m.work_area();
+        let p = wa.position.to_logical::<f64>(sc);
+        let s = wa.size.to_logical::<f64>(sc);
+        return align::Area { x: p.x.round() as i32, y: p.y.round() as i32, w: s.width.round() as i32, h: s.height.round() as i32 };
+    }
+    align::Area { x: 0, y: 0, w: 1920, h: 1040 }
+}
+
+/// Ajusta el tamaño (y la posición si se indica) de la ventana a los datos guardados de la cerca.
+fn relayout(app: &AppHandle, id: &str, with_pos: bool) {
+    let Some(f) = fence_of(app, id) else { return };
+    let Some(win) = app.get_webview_window(&label(id)) else { return };
+    let collapsed = with_fs(app, id, |s| {
+        let c = is_collapsed(&f, s.hover);
+        s.collapsed = c;
+        s.ignore_until = Instant::now() + Duration::from_millis(600);
+        c
+    });
+    let h = if collapsed { store::HEADER_H } else { f.h };
+    let _ = win.set_min_size(Some(LogicalSize::new(store::MIN_W as f64, if collapsed { store::HEADER_H } else { store::MIN_H } as f64)));
+    if with_pos {
+        let _ = win.set_position(LogicalPosition::new(f.x as f64, f.y as f64));
+    }
+    let _ = win.set_size(LogicalSize::new(f.w as f64, h as f64));
+    let _ = app.emit("layout", json!({ "id": id, "collapsed": collapsed }));
+}
 
 fn geom_changed(app: &AppHandle, id: &str) {
     let Some(win) = app.get_webview_window(&label(id)) else { return };
-    let scale = win.scale_factor().unwrap_or(1.0);
-    let (Ok(pos), Ok(size)) = (win.outer_position(), win.inner_size()) else { return };
-    let pos = pos.to_logical::<f64>(scale);
-    let size = size.to_logical::<f64>(scale);
+    let Some(f) = fence_of(app, id) else { return };
+    let ignored = with_fs(app, id, |s| Instant::now() < s.ignore_until);
+    if ignored {
+        return;
+    }
+    let Some(b) = win_box(&win) else { return };
+    if f.locked && (b.x != f.x || b.y != f.y || b.w != f.w) {
+        // bloqueada: vuelve a su sitio
+        with_fs(app, id, |s| s.ignore_until = Instant::now() + Duration::from_millis(400));
+        let h = if with_fs(app, id, |s| s.collapsed) { store::HEADER_H } else { f.h };
+        let _ = win.set_position(LogicalPosition::new(f.x as f64, f.y as f64));
+        let _ = win.set_size(LogicalSize::new(f.w as f64, h as f64));
+        return;
+    }
     let state = app.state::<AppState>();
+    let collapsed = with_fs(app, id, |s| {
+        if s.last_event.is_none() {
+            s.prev = Some(align::B { id: id.into(), x: f.x, y: f.y, w: f.w, h: if s.collapsed { store::HEADER_H } else { f.h } });
+        }
+        s.last_event = Some(Instant::now());
+        s.collapsed
+    });
     {
         let mut d = state.data.lock().unwrap();
         if let Some(f) = d.fences.iter_mut().find(|f| f.id == id) {
-            f.x = pos.x.round() as i32;
-            f.y = pos.y.round() as i32;
-            f.w = (size.width.round() as i32).max(store::MIN_W);
-            if !f.rolled {
-                f.h = (size.height.round() as i32).max(store::MIN_H);
+            f.x = b.x;
+            f.y = b.y;
+            f.w = b.w.max(store::MIN_W);
+            if !collapsed {
+                f.h = b.h.max(store::MIN_H);
             }
         }
     }
     state.touch();
+}
+
+fn neighbours(app: &AppHandle, id: &str, win: &WebviewWindow) -> Vec<align::B> {
+    let mk = monitor_key(win);
+    fence_windows(app)
+        .into_iter()
+        .filter(|w| id_of(w.label()) != id && w.is_visible().unwrap_or(false) && monitor_key(w) == mk)
+        .filter_map(|w| win_box(&w))
+        .collect()
+}
+
+/// Al terminar de mover o redimensionar: si el imán está activo, alinea con las vecinas.
+fn settle(app: &AppHandle, id: &str) {
+    let (prev, collapsed) = with_fs(app, id, |s| {
+        s.last_event = None;
+        (s.prev.take(), s.collapsed)
+    });
+    let Some(f) = fence_of(app, id) else { return };
+    let snap_on = app.state::<AppState>().data.lock().unwrap().settings.snap;
+    let Some(win) = app.get_webview_window(&label(id)) else { return };
+    if !snap_on || f.locked {
+        return;
+    }
+    let Some(cur) = win_box(&win) else { return };
+    let others = neighbours(app, id, &win);
+    let to = align::snap(&cur, prev.as_ref(), &others, work_area(&win), collapsed);
+    if to != cur {
+        let w = to.w.max(store::MIN_W);
+        let h = if collapsed { store::HEADER_H } else { to.h.max(store::MIN_H) };
+        with_fs(app, id, |s| s.ignore_until = Instant::now() + Duration::from_millis(600));
+        let _ = win.set_position(LogicalPosition::new(to.x as f64, to.y as f64));
+        let _ = win.set_size(LogicalSize::new(w as f64, h as f64));
+        let state = app.state::<AppState>();
+        {
+            let mut d = state.data.lock().unwrap();
+            if let Some(f) = d.fences.iter_mut().find(|f| f.id == id) {
+                f.x = to.x;
+                f.y = to.y;
+                f.w = w;
+                if !collapsed {
+                    f.h = h;
+                }
+            }
+        }
+        state.touch();
+    }
+}
+
+fn tick(app: &AppHandle) {
+    // enrollar al salir el ratón
+    let cur = app.cursor_position().ok();
+    let autos: Vec<String> = app.state::<AppState>().data.lock().unwrap().fences.iter().filter(|f| f.auto_roll).map(|f| f.id.clone()).collect();
+    for id in autos {
+        let inside = match (cur, app.get_webview_window(&label(&id))) {
+            (Some(c), Some(w)) if w.is_visible().unwrap_or(false) => match (w.outer_position(), w.outer_size()) {
+                (Ok(p), Ok(s)) => c.x >= p.x as f64 && c.x < (p.x + s.width as i32) as f64 && c.y >= p.y as f64 && c.y < (p.y + s.height as i32) as f64,
+                _ => false,
+            },
+            _ => false,
+        };
+        let change = with_fs(app, &id, |s| {
+            if inside {
+                s.last_inside = Instant::now();
+                if !s.hover {
+                    s.hover = true;
+                    return true;
+                }
+            } else if s.hover && !s.menu_open && s.last_inside.elapsed() > Duration::from_millis(450) {
+                s.hover = false;
+                return true;
+            }
+            false
+        });
+        if change {
+            relayout(app, &id, false);
+        }
+    }
+    // fin de un movimiento o cambio de tamaño
+    let due: Vec<String> = {
+        let st = app.state::<AppState>();
+        let m = st.fs.lock().unwrap();
+        m.iter().filter(|(_, s)| s.last_event.map(|t| t.elapsed() > Duration::from_millis(280)).unwrap_or(false)).map(|(k, _)| k.clone()).collect()
+    };
+    if !due.is_empty() && !sys::mouse_down() {
+        for id in due {
+            settle(app, &id);
+        }
+    }
+}
+
+fn apply_topmost(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    let (keep, pins): (bool, HashMap<String, bool>) = {
+        let d = st.data.lock().unwrap();
+        (d.settings.keep_on_top, d.fences.iter().map(|f| (f.id.clone(), f.pinned)).collect())
+    };
+    for w in fence_windows(app) {
+        let pin = pins.get(&id_of(w.label())).copied().unwrap_or(false);
+        let _ = w.set_always_on_top(pin || keep);
+    }
 }
 
 fn create_fence_window(app: &AppHandle, f: &store::Fence, keep_on_top: bool) {
@@ -74,7 +280,12 @@ fn create_fence_window(app: &AppHandle, f: &store::Fence, keep_on_top: bool) {
     if app.get_webview_window(&name).is_some() {
         return;
     }
-    let h = if f.rolled { store::HEADER_H } else { f.h };
+    let collapsed = is_collapsed(f, false);
+    {
+        let st = app.state::<AppState>();
+        st.fs.lock().unwrap().insert(f.id.clone(), FState::new(collapsed));
+    }
+    let h = if collapsed { store::HEADER_H } else { f.h };
     let url = WebviewUrl::App(format!("fence.html?id={}", f.id).into());
     let built = WebviewWindowBuilder::new(app, &name, url)
         .title(&f.title)
@@ -105,10 +316,6 @@ fn create_fence_window(app: &AppHandle, f: &store::Fence, keep_on_top: bool) {
     }
 }
 
-pub(crate) fn fence_windows(app: &AppHandle) -> Vec<tauri::WebviewWindow> {
-    app.webview_windows().into_iter().filter(|(k, _)| k.starts_with("fence-")).map(|(_, w)| w).collect()
-}
-
 fn toggle_all(app: &AppHandle) {
     let state = app.state::<AppState>();
     let hide = !state.all_hidden.load(Ordering::SeqCst);
@@ -118,23 +325,195 @@ fn toggle_all(app: &AppHandle) {
     }
 }
 
-fn add_fence(app: &AppHandle, near: Option<&str>) {
+/* ---------- crear, duplicar y borrar cercas ---------- */
+fn next_position(app: &AppHandle, near: Option<&str>) -> (i32, i32) {
+    let st = app.state::<AppState>();
+    let d = st.data.lock().unwrap();
+    if let Some(n) = near.and_then(|id| d.fences.iter().find(|f| f.id == id)) {
+        return (n.x + 36, n.y + 36);
+    }
+    let k = d.fences.len() as i32 % 8;
+    (60 + k * 36, 60 + k * 36)
+}
+
+fn template(app: &AppHandle, name: &str, dir: Option<PathBuf>) -> Value {
+    let p = app.path();
+    let s = |r: tauri::Result<PathBuf>| r.map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+    match name {
+        "desktop" => {
+            let public = std::env::var("PUBLIC").unwrap_or_else(|_| "C:\\Users\\Public".into());
+            let pubd = PathBuf::from(public).join("Desktop").to_string_lossy().to_string();
+            let mut dirs = vec![s(p.desktop_dir())];
+            if cfg!(windows) {
+                dirs.push(pubd);
+            }
+            json!({ "title": "Escritorio", "w": 420, "h": 320, "portal": { "dirs": dirs } })
+        }
+        "downloads" => json!({ "title": "Descargas", "w": 380, "h": 300, "portal": { "dirs": [s(p.download_dir())], "sort": "date" } }),
+        "documents" => json!({ "title": "Documentos", "w": 380, "h": 300, "portal": { "dirs": [s(p.document_dir())] } }),
+        "pictures" => json!({ "title": "Imágenes", "w": 380, "h": 300, "portal": { "dirs": [s(p.picture_dir())], "filter": "images" } }),
+        "folder" => {
+            let d = dir.unwrap_or_default();
+            let t = d.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Carpeta".into());
+            json!({ "title": t, "w": 380, "h": 300, "portal": { "dirs": [d.to_string_lossy()] } })
+        }
+        _ => json!({}),
+    }
+}
+
+fn add_fence(app: &AppHandle, near: Option<&str>, tpl: &str, dir: Option<PathBuf>) {
+    let (x, y) = next_position(app, near);
+    let mut v = template(app, tpl, dir);
+    if v.get("title").is_none() {
+        v["title"] = json!("Nueva cerca");
+    }
+    v["x"] = json!(x);
+    v["y"] = json!(y);
     let state = app.state::<AppState>();
     let (fence, keep) = {
         let mut d = state.data.lock().unwrap();
-        let (mut x, mut y) = (60 + (d.fences.len() as i32 % 8) * 36, 60 + (d.fences.len() as i32 % 8) * 36);
-        if let Some(n) = near.and_then(|id| d.fences.iter().find(|f| f.id == id)) {
-            x = n.x + 36;
-            y = n.y + 36;
-        }
-        let f = store::sanitize_fence(&json!({ "x": x, "y": y, "title": "Nueva cerca", "autoRoll": d.settings.default_auto_roll }));
+        v["autoRoll"] = json!(d.settings.default_auto_roll);
+        let f = store::sanitize_fence(&v);
         d.fences.push(f.clone());
         (f, d.settings.keep_on_top)
     };
     state.touch();
+    if state.all_hidden.load(Ordering::SeqCst) {
+        toggle_all(app);
+    }
     create_fence_window(app, &fence, keep);
 }
 
+fn duplicate_fence(app: &AppHandle, id: &str) {
+    let Some(f) = fence_of(app, id) else { return };
+    let (x, y) = next_position(app, Some(id));
+    let mut v = serde_json::to_value(&f).unwrap_or(Value::Null);
+    v["id"] = Value::Null;
+    v["title"] = json!(format!("{} (copia)", f.title));
+    v["x"] = json!(x);
+    v["y"] = json!(y);
+    let state = app.state::<AppState>();
+    let (copy, keep) = {
+        let mut d = state.data.lock().unwrap();
+        let c = store::sanitize_fence(&v);
+        d.fences.push(c.clone());
+        (c, d.settings.keep_on_top)
+    };
+    state.touch();
+    create_fence_window(app, &copy, keep);
+}
+
+fn delete_fence(app: &AppHandle, id: &str) {
+    let state = app.state::<AppState>();
+    state.data.lock().unwrap().fences.retain(|f| f.id != id);
+    state.fs.lock().unwrap().remove(id);
+    state.touch();
+    if let Some(w) = app.get_webview_window(&label(id)) {
+        let _ = w.destroy();
+    }
+}
+
+/// Cambia datos de una cerca (desde el menú o desde la propia cerca) y aplica lo que haga falta.
+fn patch_fence(app: &AppHandle, id: &str, patch: &Value, notify: bool) -> bool {
+    const ALLOWED: [&str; 10] = ["title", "items", "sort", "view", "color", "locked", "pinned", "autoRoll", "rolled", "portal"];
+    let state = app.state::<AppState>();
+    let (old, new) = {
+        let mut d = state.data.lock().unwrap();
+        let Some(f) = d.fences.iter_mut().find(|f| f.id == id) else { return false };
+        let old = f.clone();
+        let mut v = serde_json::to_value(&old).unwrap_or(Value::Null);
+        if let Some(p) = patch.as_object() {
+            for (k, val) in p {
+                if ALLOWED.contains(&k.as_str()) {
+                    v[k] = val.clone();
+                }
+            }
+        }
+        let mut nf = store::sanitize_fence(&v);
+        nf.id = old.id.clone();
+        *f = nf.clone();
+        (old, nf)
+    };
+    state.touch();
+    let keep = state.data.lock().unwrap().settings.keep_on_top;
+    if let Some(win) = app.get_webview_window(&label(id)) {
+        if old.pinned != new.pinned {
+            let _ = win.set_always_on_top(new.pinned || keep);
+        }
+        if old.locked != new.locked {
+            let _ = win.set_resizable(!new.locked);
+        }
+        if old.title != new.title {
+            let _ = win.set_title(&new.title);
+        }
+    }
+    if old.rolled != new.rolled || old.auto_roll != new.auto_roll {
+        relayout(app, id, false);
+    }
+    if notify {
+        let _ = app.emit("reload", json!({ "id": id }));
+    }
+    true
+}
+
+/* ---------- alinear, igualar y ordenar ---------- */
+fn peers(app: &AppHandle, id: &str) -> Vec<align::B> {
+    let Some(win) = app.get_webview_window(&label(id)) else { return vec![] };
+    let mk = monitor_key(&win);
+    let wins: Vec<String> = fence_windows(app)
+        .into_iter()
+        .filter(|w| w.is_visible().unwrap_or(false) && monitor_key(w) == mk)
+        .map(|w| id_of(w.label()))
+        .collect();
+    let d = app.state::<AppState>();
+    let d = d.data.lock().unwrap();
+    d.fences.iter().filter(|f| wins.contains(&f.id)).map(|f| align::B { id: f.id.clone(), x: f.x, y: f.y, w: f.w, h: f.h }).collect()
+}
+
+fn apply_boxes(app: &AppHandle, boxes: Vec<align::B>) {
+    let state = app.state::<AppState>();
+    let mut changed = vec![];
+    {
+        let mut d = state.data.lock().unwrap();
+        for b in boxes {
+            if let Some(f) = d.fences.iter_mut().find(|f| f.id == b.id) {
+                if f.locked {
+                    continue;
+                }
+                f.x = b.x;
+                f.y = b.y;
+                f.w = b.w.max(store::MIN_W);
+                f.h = b.h.max(store::MIN_H);
+                changed.push(b.id);
+            }
+        }
+    }
+    state.touch();
+    for id in changed {
+        relayout(app, &id, true);
+    }
+}
+
+fn align_to(app: &AppHandle, id: &str, name: &str) {
+    let list = peers(app, id);
+    let Some(r) = list.iter().find(|b| b.id == id).cloned() else { return };
+    if let Some(out) = align::op(name, &list, &r) {
+        apply_boxes(app, out.into_iter().filter(|b| b.id != id).collect());
+    }
+}
+
+fn tidy(app: &AppHandle, id: &str) {
+    let list = peers(app, id);
+    if list.is_empty() {
+        return;
+    }
+    let Some(win) = app.get_webview_window(&label(id)) else { return };
+    let wa = work_area(&win);
+    let r = align::common_size(&list);
+    apply_boxes(app, align::tidy_grid(&list, &r, wa));
+}
+
+/* ---------- configuración ---------- */
 fn open_settings(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show();
@@ -152,28 +531,15 @@ fn open_settings(app: &AppHandle) {
     }
 }
 
-/* ---------- comandos (los que usa la interfaz) ---------- */
 fn settings_payload(app: &AppHandle, state: &AppState) -> Value {
     let d = state.data.lock().unwrap();
     json!({
         "settings": d.settings,
-        "autoStart": false,
+        "autoStart": sys::autostart_get(),
         "version": app.package_info().version.to_string(),
         "dataDir": state.dir.to_string_lossy(),
         "hotkey": d.settings.hotkey,
     })
-}
-
-#[tauri::command]
-fn state_get(state: State<AppState>, id: String) -> Option<Value> {
-    let d = state.data.lock().unwrap();
-    let f = d.fences.iter().find(|f| f.id == id)?;
-    Some(json!({ "fence": f, "settings": d.settings, "collapsed": f.rolled }))
-}
-
-#[tauri::command]
-fn settings_get(app: AppHandle, state: State<AppState>) -> Value {
-    settings_payload(&app, &state)
 }
 
 fn set_hotkey(app: &AppHandle, new: &str, old: &str) -> Result<(), String> {
@@ -184,6 +550,308 @@ fn set_hotkey(app: &AppHandle, new: &str, old: &str) -> Result<(), String> {
         return Err(e.to_string());
     }
     Ok(())
+}
+
+/// Cierra todas las cercas y las vuelve a crear desde los datos (importar / restablecer).
+fn replace_everything(app: &AppHandle, mut data: store::Data) {
+    let state = app.state::<AppState>();
+    for w in fence_windows(app) {
+        let _ = w.destroy();
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    if data.fences.is_empty() {
+        data.fences.push(store::sanitize_fence(&json!({ "title": "Mi primera cerca" })));
+    }
+    {
+        let mut d = state.data.lock().unwrap();
+        data.hidden = d.hidden.clone(); // lo que ocultamos antes se vuelve a mostrar si ya no corresponde
+        *d = data.clone();
+    }
+    state.fs.lock().unwrap().clear();
+    state.touch();
+    let keep = data.settings.keep_on_top;
+    for f in &data.fences {
+        create_fence_window(app, f, keep);
+    }
+    let _ = app.emit("settings", json!({ "settings": data.settings }));
+}
+
+/* ---------- menús contextuales ---------- */
+type MI = Box<dyn IsMenuItem<Wry>>;
+
+fn mid(fid: &str, action: &str, arg: &str) -> String {
+    format!("cm|{fid}|{action}|{arg}")
+}
+fn item(app: &AppHandle, id: String, text: &str, enabled: bool) -> MI {
+    Box::new(MenuItem::with_id(app, id, text, enabled, None::<&str>).expect("menú"))
+}
+fn check(app: &AppHandle, id: String, text: &str, on: bool) -> MI {
+    Box::new(CheckMenuItem::with_id(app, id, text, true, on, None::<&str>).expect("menú"))
+}
+fn sep(app: &AppHandle) -> MI {
+    Box::new(PredefinedMenuItem::separator(app).expect("menú"))
+}
+fn sub(app: &AppHandle, text: &str, items: Vec<MI>) -> MI {
+    let refs: Vec<&dyn IsMenuItem<Wry>> = items.iter().map(|b| b.as_ref()).collect();
+    Box::new(Submenu::with_items(app, text, true, &refs).expect("menú"))
+}
+fn menu_of(app: &AppHandle, items: Vec<MI>) -> Menu<Wry> {
+    let refs: Vec<&dyn IsMenuItem<Wry>> = items.iter().map(|b| b.as_ref()).collect();
+    Menu::with_items(app, &refs).expect("menú")
+}
+
+fn popup(app: &AppHandle, id: &str, build: impl FnOnce(&AppHandle) -> Menu<Wry> + Send + 'static) {
+    let app2 = app.clone();
+    let id = id.to_string();
+    let _ = app.run_on_main_thread(move || {
+        let menu = build(&app2);
+        with_fs(&app2, &id, |s| s.menu_open = true);
+        if let Some(w) = app2.get_webview_window(&label(&id)) {
+            let _ = w.popup_menu(&menu);
+        }
+        with_fs(&app2, &id, |s| {
+            s.menu_open = false;
+            s.last_inside = Instant::now();
+        });
+    });
+}
+
+const COLORS: [(&str, &str); 8] = [
+    ("Automático", "none"), ("Azul", "#4d8dff"), ("Verde", "#2fbf71"), ("Violeta", "#8b5cf6"),
+    ("Naranja", "#ff8a3d"), ("Rojo", "#ef4b5f"), ("Rosa", "#ec5fa8"), ("Gris", "#8b95a7"),
+];
+const FILTERS: [(&str, &str); 8] = [
+    ("all", "Todo"), ("folders", "Carpetas"), ("shortcuts", "Accesos directos"), ("docs", "Documentos"),
+    ("images", "Imágenes"), ("media", "Audio y vídeo"), ("archives", "Comprimidos"), ("apps", "Programas"),
+];
+const PORTAL_SORTS: [(&str, &str); 4] = [("name", "Nombre"), ("date", "Fecha de modificación"), ("size", "Tamaño"), ("type", "Tipo")];
+const FENCE_SORTS: [(&str, &str); 3] = [("manual", "Manual (arrastrar)"), ("name", "Nombre"), ("type", "Tipo")];
+
+fn new_fence_items(app: &AppHandle, id: &str) -> Vec<MI> {
+    vec![
+        item(app, mid(id, "new", "empty"), "Cerca vacía", true),
+        sep(app),
+        item(app, mid(id, "new", "desktop"), "Portal: Escritorio", true),
+        item(app, mid(id, "new", "downloads"), "Portal: Descargas", true),
+        item(app, mid(id, "new", "documents"), "Portal: Documentos", true),
+        item(app, mid(id, "new", "pictures"), "Portal: Imágenes", true),
+        item(app, mid(id, "new", "folder"), "Portal: elegir carpeta…", true),
+    ]
+}
+
+fn build_fence_menu(app: &AppHandle, f: &store::Fence, snap: bool) -> Menu<Wry> {
+    let id = f.id.as_str();
+    let radio = |v: &str, text: &str, on: bool, act: &str| check(app, mid(id, act, v), text, on);
+    let mut t: Vec<MI> = vec![
+        sub(app, "Nueva cerca", new_fence_items(app, id)),
+        sep(app),
+        item(app, mid(id, "rename", ""), "Cambiar nombre…", true),
+        item(app, mid(id, "roll", ""), if f.rolled { "Desenrollar" } else { "Enrollar" }, !f.auto_roll),
+        check(app, mid(id, "autoroll", ""), "Enrollar al salir el ratón", f.auto_roll),
+        sub(app, "Alinear y ordenar", vec![
+            item(app, mid(id, "align", "size"), "Igualar tamaño de todas a esta", true),
+            item(app, mid(id, "align", "width"), "Igualar solo el ancho", true),
+            item(app, mid(id, "align", "height"), "Igualar solo el alto", true),
+            sep(app),
+            item(app, mid(id, "align", "left"), "Alinear las demás por la izquierda", true),
+            item(app, mid(id, "align", "top"), "Alinear las demás por arriba", true),
+            item(app, mid(id, "align", "right"), "Alinear las demás por la derecha", true),
+            item(app, mid(id, "align", "bottom"), "Alinear las demás por abajo", true),
+            sep(app),
+            item(app, mid(id, "align", "column"), "Apilar las demás en columna debajo de esta", true),
+            item(app, mid(id, "tidy", ""), "Ordenar todas en cuadrícula", true),
+            sep(app),
+            check(app, mid(id, "snap", ""), "Imán entre cercas", snap),
+        ]),
+        check(app, mid(id, "locked", ""), "Bloquear posición y tamaño", f.locked),
+        check(app, mid(id, "pinned", ""), "Mantener encima de otras ventanas", f.pinned),
+        sep(app),
+        sub(app, "Color", COLORS.iter().map(|(n, c)| radio(c, n, f.color.as_deref().unwrap_or("none") == *c, "color")).collect()),
+        sub(app, "Vista", vec![radio("grid", "Cuadrícula", f.view == "grid", "view"), radio("list", "Lista", f.view == "list", "view")]),
+    ];
+    if let Some(p) = &f.portal {
+        t.push(sub(app, "Ordenar por", PORTAL_SORTS.iter().map(|(k, n)| radio(k, n, p.sort == *k, "psort")).collect()));
+        t.push(sub(app, "Mostrar", FILTERS.iter().map(|(k, n)| radio(k, n, p.filter == *k, "pfilter")).collect()));
+        t.push(check(app, mid(id, "phidden", ""), "Mostrar archivos ocultos", p.show_hidden));
+        t.push(item(app, mid(id, "openfolder", ""), "Abrir carpeta", true));
+        t.push(item(app, mid(id, "unportal", ""), "Quitar portal (volver a cerca normal)", true));
+    } else {
+        t.push(sub(app, "Ordenar por", FENCE_SORTS.iter().map(|(k, n)| radio(k, n, f.sort == *k, "sort")).collect()));
+        t.push(item(app, mid(id, "toportal", ""), "Convertir en portal de carpeta…", true));
+        t.push(item(app, mid(id, "vaciar", ""), "Vaciar cerca", !f.items.is_empty()));
+    }
+    t.push(sep(app));
+    t.push(item(app, mid(id, "dup", ""), "Duplicar cerca", true));
+    t.push(item(app, mid(id, "del", ""), "Eliminar cerca…", true));
+    t.push(sep(app));
+    t.push(item(app, mid(id, "settings", ""), "Configuración…", true));
+    menu_of(app, t)
+}
+
+fn toggle_of(f: &store::Fence, k: &str) -> Value {
+    json!(match k {
+        "locked" => !f.locked,
+        "pinned" => !f.pinned,
+        "autoRoll" => !f.auto_roll,
+        "rolled" => !f.rolled,
+        _ => false,
+    })
+}
+
+fn move_item(app: &AppHandle, src: &str, target: Option<&str>, path: &str) -> Option<String> {
+    let state = app.state::<AppState>();
+    let k = key(path);
+    let result;
+    {
+        let mut d = state.data.lock().unwrap();
+        let hide = d.settings.hide_desktop;
+        let dirs = desk::desktop_dirs(state.desktop.clone());
+        let s = d.fences.iter().position(|f| f.id == src)?;
+        if d.fences[s].portal.is_some() {
+            return None;
+        }
+        let i = d.fences[s].items.iter().position(|it| key(&it.p) == k)?;
+        if let Some(t) = target {
+            let ti = d.fences.iter().position(|f| f.id == t)?;
+            if d.fences[ti].portal.is_some() || ti == s {
+                return None;
+            }
+            let it = d.fences[s].items.remove(i);
+            if !d.fences[ti].items.iter().any(|x| key(&x.p) == k) {
+                d.fences[ti].items.push(it);
+            }
+            result = "moved".to_string();
+        } else {
+            d.fences[s].items.remove(i);
+            result = if hide && desk::in_desktop(path, &dirs) { "desktop".into() } else { "removed".to_string() };
+        }
+    }
+    state.touch();
+    let _ = app.emit("reload", json!({ "id": src }));
+    if let Some(t) = target {
+        let _ = app.emit("reload", json!({ "id": t }));
+    }
+    Some(result)
+}
+
+fn fence_action(app: &AppHandle, id: &str, action: &str, arg: &str) {
+    let Some(f) = fence_of(app, id) else { return };
+    let st = app.state::<AppState>();
+    match action {
+        "new" => match arg {
+            "folder" => {
+                if let Some(d) = sys::pick_folder() {
+                    add_fence(app, Some(id), "folder", Some(d));
+                }
+            }
+            t => add_fence(app, Some(id), if t == "empty" { "" } else { t }, None),
+        },
+        "rename" => {
+            if let Some(w) = app.get_webview_window(&label(id)) {
+                let _ = w.set_focus();
+            }
+            let _ = app.emit("rename-title", json!({ "id": id }));
+        }
+        "roll" => {
+            patch_fence(app, id, &json!({ "rolled": toggle_of(&f, "rolled") }), true);
+        }
+        "autoroll" => {
+            patch_fence(app, id, &json!({ "autoRoll": toggle_of(&f, "autoRoll") }), true);
+        }
+        "locked" => {
+            patch_fence(app, id, &json!({ "locked": toggle_of(&f, "locked") }), true);
+        }
+        "pinned" => {
+            patch_fence(app, id, &json!({ "pinned": toggle_of(&f, "pinned") }), true);
+        }
+        "align" => align_to(app, id, arg),
+        "tidy" => tidy(app, id),
+        "snap" => {
+            let s = {
+                let mut d = st.data.lock().unwrap();
+                d.settings.snap = !d.settings.snap;
+                d.settings.clone()
+            };
+            st.touch();
+            let _ = app.emit("settings", json!({ "settings": s }));
+        }
+        "color" => {
+            patch_fence(app, id, &json!({ "color": if arg == "none" { Value::Null } else { json!(arg) } }), true);
+        }
+        "view" => {
+            patch_fence(app, id, &json!({ "view": arg }), true);
+        }
+        "sort" => {
+            patch_fence(app, id, &json!({ "sort": arg }), true);
+        }
+        "psort" | "pfilter" | "phidden" => {
+            let mut p = serde_json::to_value(&f.portal).unwrap_or(Value::Null);
+            if p.is_object() {
+                match action {
+                    "psort" => p["sort"] = json!(arg),
+                    "pfilter" => p["filter"] = json!(arg),
+                    _ => p["showHidden"] = json!(!f.portal.as_ref().map(|x| x.show_hidden).unwrap_or(false)),
+                }
+                patch_fence(app, id, &json!({ "portal": p }), true);
+            }
+        }
+        "openfolder" => {
+            if let Some(d) = f.portal.as_ref().and_then(|p| p.dirs.first()) {
+                icons::open(d);
+            }
+        }
+        "unportal" => {
+            patch_fence(app, id, &json!({ "portal": Value::Null }), true);
+        }
+        "toportal" => {
+            if let Some(d) = sys::pick_folder() {
+                patch_fence(app, id, &json!({ "portal": { "dirs": [d.to_string_lossy()] } }), true);
+            }
+        }
+        "vaciar" => {
+            patch_fence(app, id, &json!({ "items": [] }), true);
+        }
+        "dup" => duplicate_fence(app, id),
+        "del" => {
+            if sys::confirm("Eliminar cerca", &format!("¿Eliminar la cerca «{}»?", f.title), "Tus archivos no se borran; solo se elimina la cerca.") {
+                delete_fence(app, id);
+            }
+        }
+        "settings" => open_settings(app),
+        "moveto" => {
+            if let Some((t, p)) = arg.split_once('|') {
+                move_item(app, id, Some(t), p);
+            }
+        }
+        "show" => sys::show_in_folder(arg),
+        "i-open" | "i-rename" | "i-restore" | "i-remove" | "i-copy" => {
+            let _ = app.emit("item-action", json!({ "id": id, "action": &action[2..], "path": arg }));
+        }
+        _ => {}
+    }
+}
+
+fn handle_menu(app: &AppHandle, id: &str) {
+    let mut it = id.splitn(4, '|');
+    let (_, Some(fid), Some(action), Some(arg)) = (it.next(), it.next(), it.next(), it.next()) else { return };
+    let (app, fid, action, arg) = (app.clone(), fid.to_string(), action.to_string(), arg.to_string());
+    bg(move || fence_action(&app, &fid, &action, &arg));
+}
+
+/* ---------- comandos (los que usa la interfaz) ---------- */
+#[tauri::command]
+fn state_get(app: AppHandle, state: State<AppState>, id: String) -> Option<Value> {
+    let (f, settings) = {
+        let d = state.data.lock().unwrap();
+        (d.fences.iter().find(|f| f.id == id)?.clone(), d.settings.clone())
+    };
+    let collapsed = with_fs(&app, &id, |s| s.collapsed);
+    Some(json!({ "fence": f, "settings": settings, "collapsed": collapsed }))
+}
+
+#[tauri::command]
+fn settings_get(app: AppHandle, state: State<AppState>) -> Value {
+    settings_payload(&app, &state)
 }
 
 #[tauri::command]
@@ -197,6 +865,11 @@ fn settings_set(app: AppHandle, state: State<AppState>, patch: Value) -> Value {
     if let (Some(cur), Some(p)) = (next.as_object_mut(), patch.as_object()) {
         for (k, v) in p {
             if k == "autoStart" {
+                if let Some(on) = v.as_bool() {
+                    if !sys::autostart_set(on) {
+                        error = json!("No se pudo cambiar el inicio con Windows.");
+                    }
+                }
                 continue;
             }
             if k == "hotkey" {
@@ -220,6 +893,7 @@ fn settings_set(app: AppHandle, state: State<AppState>, patch: Value) -> Value {
         state.data.lock().unwrap().settings = settings.clone();
     }
     state.touch();
+    apply_topmost(&app);
     let _ = app.emit("settings", json!({ "settings": settings }));
     let mut out = settings_payload(&app, &state);
     out["error"] = error;
@@ -227,32 +901,8 @@ fn settings_set(app: AppHandle, state: State<AppState>, patch: Value) -> Value {
 }
 
 #[tauri::command]
-fn fence_patch(state: State<AppState>, id: String, patch: Value) -> bool {
-    {
-        let mut d = state.data.lock().unwrap();
-        let Some(f) = d.fences.iter_mut().find(|f| f.id == id) else { return false };
-        if let Some(t) = patch.get("title").and_then(|v| v.as_str()) {
-            let t: String = t.chars().take(80).collect();
-            if !t.trim().is_empty() {
-                f.title = t.trim().to_string();
-            }
-        }
-        if let Some(a) = patch.get("items").and_then(|v| v.as_array()) {
-            f.items = a.iter().filter_map(store::sanitize_item).take(500).collect();
-        }
-        if let Some(s) = patch.get("sort").and_then(|v| v.as_str()) {
-            if ["manual", "name", "type"].contains(&s) {
-                f.sort = s.into();
-            }
-        }
-        if let Some(v) = patch.get("view").and_then(|v| v.as_str()) {
-            if ["grid", "list"].contains(&v) {
-                f.view = v.into();
-            }
-        }
-    }
-    state.touch();
-    true
+fn fence_patch(app: AppHandle, id: String, patch: Value) -> bool {
+    patch_fence(&app, &id, &patch, false)
 }
 
 #[tauri::command]
@@ -284,32 +934,6 @@ async fn icon_get(state: State<'_, AppState>, path: String, size: Option<i64>, i
 #[tauri::command]
 fn item_open(path: String) -> String {
     if path.is_empty() || icons::open(&path) { String::new() } else { "No se pudo abrir".into() }
-}
-
-#[tauri::command]
-fn item_add(app: AppHandle, state: State<AppState>, id: String, paths: Vec<String>, index: Option<usize>) -> usize {
-    let added = {
-        let mut d = state.data.lock().unwrap();
-        let Some(f) = d.fences.iter_mut().find(|f| f.id == id) else { return 0 };
-        if f.portal.is_some() {
-            return 0;
-        }
-        let mut have: std::collections::HashSet<String> = f.items.iter().map(|i| key(&i.p)).collect();
-        let fresh: Vec<store::Item> = paths
-            .into_iter()
-            .filter(|p| !p.is_empty() && have.insert(key(p)))
-            .map(|p| store::Item { p, n: None })
-            .collect();
-        let n = fresh.len();
-        let at = index.map(|i| i.min(f.items.len())).unwrap_or(f.items.len());
-        f.items.splice(at..at, fresh);
-        n
-    };
-    if added > 0 {
-        state.touch();
-        let _ = app.emit("reload", json!({ "id": id }));
-    }
-    added
 }
 
 #[tauri::command]
@@ -345,28 +969,43 @@ fn portal_list(state: State<AppState>, id: String) -> Value {
 }
 
 #[tauri::command]
-async fn app_action(app: AppHandle, state: State<'_, AppState>, id: String, name: String) -> Result<(), ()> {
+fn item_add(app: AppHandle, state: State<AppState>, id: String, paths: Vec<String>, index: Option<usize>) -> usize {
+    let added = {
+        let mut d = state.data.lock().unwrap();
+        let Some(f) = d.fences.iter_mut().find(|f| f.id == id) else { return 0 };
+        if f.portal.is_some() {
+            return 0;
+        }
+        let mut have: std::collections::HashSet<String> = f.items.iter().map(|i| key(&i.p)).collect();
+        let fresh: Vec<store::Item> = paths
+            .into_iter()
+            .filter(|p| !p.is_empty() && have.insert(key(p)))
+            .map(|p| store::Item { p, n: None })
+            .collect();
+        let n = fresh.len();
+        let at = index.map(|i| i.min(f.items.len())).unwrap_or(f.items.len());
+        f.items.splice(at..at, fresh);
+        n
+    };
+    if added > 0 {
+        state.touch();
+        let _ = app.emit("reload", json!({ "id": id }));
+    }
+    added
+}
+
+#[tauri::command]
+async fn app_action(app: AppHandle, id: String, name: String) -> Result<(), ()> {
     match name.as_str() {
         "settings" => open_settings(&app),
-        "newFence" => add_fence(&app, Some(&id)),
+        "newFence" => add_fence(&app, Some(&id), "", None),
         "toggleAll" => toggle_all(&app),
         "toggleRoll" => {
-            let (collapsed, w, h) = {
-                let mut d = state.data.lock().unwrap();
-                let Some(f) = d.fences.iter_mut().find(|f| f.id == id) else { return Ok(()) };
-                if f.auto_roll {
-                    return Ok(());
+            if let Some(f) = fence_of(&app, &id) {
+                if !f.auto_roll {
+                    patch_fence(&app, &id, &json!({ "rolled": !f.rolled }), true);
                 }
-                f.rolled = !f.rolled;
-                (f.rolled, f.w, f.h)
-            };
-            state.touch();
-            if let Some(win) = app.get_webview_window(&label(&id)) {
-                let height = if collapsed { store::HEADER_H } else { h };
-                let _ = win.set_size(LogicalSize::new(w as f64, height as f64));
             }
-            let _ = app.emit("layout", json!({ "id": id, "collapsed": collapsed }));
-            let _ = app.emit("reload", json!({ "id": id }));
         }
         _ => {}
     }
@@ -374,26 +1013,95 @@ async fn app_action(app: AppHandle, state: State<'_, AppState>, id: String, name
 }
 
 #[tauri::command]
-fn data_action(state: State<AppState>, name: String) -> Value {
-    match name.as_str() {
-        "openFolder" => {
-            icons::open(&state.dir.to_string_lossy());
-            json!({ "ok": true })
+async fn data_action(app: AppHandle, name: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Value {
+        let state = app.state::<AppState>();
+        match name.as_str() {
+            "openFolder" | "openLog" => {
+                icons::open(&state.dir.to_string_lossy());
+                json!({ "ok": true })
+            }
+            "export" => {
+                let Some(p) = sys::save_json("mis-cercas-config.json") else { return json!({ "ok": false, "canceled": true }) };
+                let data = state.data.lock().unwrap().clone();
+                match serde_json::to_string_pretty(&data).map_err(|e| e.to_string()).and_then(|t| std::fs::write(&p, t).map_err(|e| e.to_string())) {
+                    Ok(()) => json!({ "ok": true }),
+                    Err(_) => json!({ "ok": false, "error": "No se pudo guardar el archivo." }),
+                }
+            }
+            "import" => {
+                let Some(p) = sys::open_json() else { return json!({ "ok": false, "canceled": true }) };
+                let Some(raw) = std::fs::read_to_string(&p).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else {
+                    return json!({ "ok": false, "error": "El archivo no es una configuración válida." });
+                };
+                if !sys::confirm("Mis Cercas", "¿Reemplazar tus cercas actuales?", "Se sustituirán por las del archivo importado.") {
+                    return json!({ "ok": false, "canceled": true });
+                }
+                replace_everything(&app, store::normalize(&raw));
+                json!({ "ok": true })
+            }
+            "reset" => {
+                if !sys::confirm("Mis Cercas", "¿Restablecer Mis Cercas?", "Se borrarán todas tus cercas y ajustes.") {
+                    return json!({ "ok": false, "canceled": true });
+                }
+                replace_everything(&app, store::normalize(&Value::Null));
+                json!({ "ok": true })
+            }
+            _ => json!({ "ok": false }),
         }
-        _ => json!({ "ok": false, "error": "Esta acción todavía no está disponible en esta versión de prueba." }),
-    }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
-// Pendientes de portar (menús contextuales, mover entre cercas, sacar al Escritorio)
 #[tauri::command]
 async fn fence_menu(app: AppHandle, id: String) {
-    let _ = id;
-    open_settings(&app);
+    let Some(f) = fence_of(&app, &id) else { return };
+    let snap = app.state::<AppState>().data.lock().unwrap().settings.snap;
+    popup(&app, &id, move |a| build_fence_menu(a, &f, snap));
 }
+
 #[tauri::command]
-fn item_menu() -> Option<String> {
+async fn item_menu(app: AppHandle, id: String, args: Option<Value>) -> Option<String> {
+    let args = args?;
+    let path = args.get("path")?.as_str()?.to_string();
+    let index = args.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let f = fence_of(&app, &id)?;
+    let others: Vec<(String, String)> = {
+        let d = app.state::<AppState>();
+        let d = d.data.lock().unwrap();
+        d.fences.iter().filter(|o| o.id != id && o.portal.is_none()).map(|o| (o.id.clone(), o.title.clone())).collect()
+    };
+    let renamed = index >= 0 && f.items.get(index as usize).map(|i| i.n.is_some()).unwrap_or(false);
+    let back = {
+        let st = app.state::<AppState>();
+        let hide = st.data.lock().unwrap().settings.hide_desktop;
+        hide && desk::in_desktop(&path, &desk::desktop_dirs(st.desktop.clone()))
+    };
+    let id2 = id.clone();
+    popup(&app, &id2, move |a| {
+        let mut t: Vec<MI> = vec![
+            item(a, mid(&id, "i-open", &path), "Abrir", true),
+            item(a, mid(&id, "show", &path), "Mostrar en carpeta", true),
+            item(a, mid(&id, "i-copy", &path), "Copiar ruta", true),
+        ];
+        if f.portal.is_none() {
+            t.push(sep(a));
+            t.push(item(a, mid(&id, "i-rename", &path), "Cambiar nombre mostrado…", true));
+            if renamed {
+                t.push(item(a, mid(&id, "i-restore", &path), "Restaurar nombre original", true));
+            }
+            if !others.is_empty() {
+                let subs: Vec<MI> = others.iter().map(|(oid, title)| item(a, mid(&id, "moveto", &format!("{oid}|{path}")), title, true)).collect();
+                t.push(sub(a, "Mover a", subs));
+            }
+            t.push(item(a, mid(&id, "i-remove", &path), if back { "Sacar de la cerca (vuelve al Escritorio)" } else { "Quitar de la cerca" }, true));
+        }
+        menu_of(a, t)
+    });
     None
 }
+
 #[tauri::command]
 fn item_transfer() -> bool {
     false
@@ -401,7 +1109,7 @@ fn item_transfer() -> bool {
 
 /// Se soltó un elemento fuera de su cerca: pasa a otra cerca si el cursor está sobre una, o sale de la cerca.
 #[tauri::command]
-fn item_release(app: AppHandle, state: State<AppState>, id: String, args: Option<Value>) -> Option<String> {
+fn item_release(app: AppHandle, id: String, args: Option<Value>) -> Option<String> {
     let path = args.as_ref()?.get("path")?.as_str()?.to_string();
     let cur = app.cursor_position().ok()?;
     let mut target: Option<String> = None;
@@ -411,46 +1119,15 @@ fn item_release(app: AppHandle, state: State<AppState>, id: String, args: Option
         }
         let (Ok(p), Ok(s)) = (w.outer_position(), w.outer_size()) else { continue };
         if cur.x >= p.x as f64 && cur.x < (p.x + s.width as i32) as f64 && cur.y >= p.y as f64 && cur.y < (p.y + s.height as i32) as f64 {
-            let wid = w.label().trim_start_matches("fence-").to_string();
+            let wid = id_of(w.label());
             if wid == id {
-                return None; // cayó sobre su propia cerca
+                return None;
             }
             target = Some(wid);
             break;
         }
     }
-    let k = key(&path);
-    let result;
-    {
-        let mut d = state.data.lock().unwrap();
-        let hide = d.settings.hide_desktop;
-        let dirs = desk::desktop_dirs(state.desktop.clone());
-        let Some(src) = d.fences.iter().position(|f| f.id == id) else { return None };
-        if d.fences[src].portal.is_some() {
-            return None;
-        }
-        let Some(i) = d.fences[src].items.iter().position(|it| key(&it.p) == k) else { return None };
-        if let Some(t) = &target {
-            let Some(ti) = d.fences.iter().position(|f| &f.id == t) else { return None };
-            if d.fences[ti].portal.is_some() {
-                return None;
-            }
-            let item = d.fences[src].items.remove(i);
-            if !d.fences[ti].items.iter().any(|it| key(&it.p) == k) {
-                d.fences[ti].items.push(item);
-            }
-            result = "moved".to_string();
-        } else {
-            d.fences[src].items.remove(i);
-            result = if hide && desk::in_desktop(&path, &dirs) { "desktop".into() } else { "removed".to_string() };
-        }
-    }
-    state.touch();
-    let _ = app.emit("reload", json!({ "id": id }));
-    if let Some(t) = target {
-        let _ = app.emit("reload", json!({ "id": t }));
-    }
-    Some(result)
+    move_item(&app, &id, target.as_deref(), &path)
 }
 
 /* ---------- arranque ---------- */
@@ -474,16 +1151,21 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     if let Some(icon) = app.default_window_icon() {
         b = b.icon(icon.clone());
     }
-    b.on_menu_event(|app, ev| match ev.id().as_ref() {
-        "new" => add_fence(app, None),
-        "toggle" => toggle_all(app),
-        "settings" => open_settings(app),
-        "folder" => {
-            let st = app.state::<AppState>();
-            icons::open(&st.dir.to_string_lossy());
-        }
-        "quit" => app.exit(0),
-        _ => {}
+    b.on_menu_event(|app, ev| {
+        let app = app.clone();
+        let id = ev.id().as_ref().to_string();
+        // crear ventanas desde el hilo principal bloquea Windows: se hace en otro hilo
+        bg(move || match id.as_str() {
+            "new" => add_fence(&app, None, "", None),
+            "toggle" => toggle_all(&app),
+            "settings" => open_settings(&app),
+            "folder" => {
+                let st = app.state::<AppState>();
+                icons::open(&st.dir.to_string_lossy());
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        });
     })
     .on_tray_icon_event(|tray, ev| {
         if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = ev {
@@ -505,6 +1187,12 @@ pub fn run() {
                 })
                 .build(),
         )
+        .on_menu_event(|app, ev| {
+            let id = ev.id().as_ref().to_string();
+            if id.starts_with("cm|") {
+                handle_menu(app, &id);
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             let dir = data_dir(&handle);
@@ -523,6 +1211,7 @@ pub fn run() {
                 dirty: AtomicBool::new(true),
                 icons: Mutex::new(HashMap::new()),
                 all_hidden: AtomicBool::new(false),
+                fs: Mutex::new(HashMap::new()),
             });
             for f in &fences {
                 create_fence_window(&handle, f, keep);
@@ -532,11 +1221,18 @@ pub fn run() {
             if let Err(e) = handle.global_shortcut().register(hotkey.as_str()) {
                 eprintln!("No se pudo registrar el atajo {hotkey}: {e}");
             }
-            // guarda los cambios poco después de hacerlos (mover o redimensionar avisa muchas veces)
+            // guarda los cambios poco después de hacerlos y vigila el ratón (enrollar, imán)
             let h2 = handle.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                h2.state::<AppState>().flush();
+            std::thread::spawn(move || {
+                let mut n = 0u32;
+                loop {
+                    std::thread::sleep(Duration::from_millis(90));
+                    tick(&h2);
+                    n += 1;
+                    if n % 4 == 0 {
+                        h2.state::<AppState>().flush();
+                    }
+                }
             });
             Ok(())
         })

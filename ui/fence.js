@@ -331,11 +331,27 @@
     const i = Number(el.dataset.i);
     select(i, false);
     const en = entries[i];
-    const action = await api.itemMenu({ index: en.src, path: en.path });
+    menuEntry = { i, en };
+    api.itemMenu({ index: en.src, path: en.path });
+  });
+  let menuEntry = null;
+  api.onItemAction(({ action, path }) => {
+    const m = menuEntry;
+    if (!m) return;
+    const { i, en } = m;
     if (action === 'open') openEntry(en);
     else if (action === 'rename') startItemRename(i);
     else if (action === 'restore') updateItem(en.src, (it) => { delete it.n; });
     else if (action === 'remove') removeItem(en.src);
+    else if (action === 'copy') {
+      const t = document.createElement('textarea');
+      t.value = path || en.path;
+      document.body.appendChild(t);
+      t.select();
+      try { document.execCommand('copy'); } catch { /* sin portapapeles */ }
+      t.remove();
+      toast('Ruta copiada');
+    }
   });
 
   $('btnRoll').addEventListener('click', () => api.action('toggleRoll'));
