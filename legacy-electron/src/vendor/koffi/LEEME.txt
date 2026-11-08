@@ -1,0 +1,2 @@
+Koffi 3.3.3 (MIT) - https://koffi.dev
+Binario precompilado para Windows x64, usado para detectar "Mostrar escritorio".

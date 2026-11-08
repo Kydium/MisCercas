@@ -1,0 +1,181 @@
+:root {
+  --accent: #4d8dff;
+  --accent-rgb: 77, 141, 255;
+  --alpha: 0.62;
+  --radius: 10px;
+  --icon: 40px;
+  --surface: 20, 25, 38;
+  --surface2: 20, 25, 38;
+  --text: #f3f6fc;
+  --muted: rgba(243, 246, 252, 0.62);
+  --border: rgba(255, 255, 255, 0.16);
+  --hover: rgba(255, 255, 255, 0.12);
+  --tool-hover: rgba(255, 255, 255, 0.2);
+  --sel-a: 0.38;
+  --sel: rgba(var(--accent-rgb), var(--sel-a));
+  --hdr-text: #fff;
+  --hdr-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --hdr-tint: 0.5;
+  --hdr-bg: none;
+  --hdr-k: 0.55;
+  --hdr-clear: 0.16;
+  --glass-min: 0;
+  --clear-min: 0;
+  --hdr-halo: none;
+  --shine: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0));
+  --gloss: linear-gradient(180deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.02));
+  --rim: inset 0 1px 0 var(--hl);
+  --bar-line: var(--border);
+  --label-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+  --input-bg: rgba(0, 0, 0, 0.4);
+  --hl: rgba(255, 255, 255, 0.07);
+  --glow: 0 0 0 0 transparent;
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --fence-bg: rgba(var(--surface), var(--alpha));
+}
+:root[data-grad="1"] {
+  --fence-bg: linear-gradient(155deg, rgba(var(--surface), var(--alpha)), rgba(var(--surface2), var(--alpha)));
+}
+/* hasta que llega el tema no se dibuja nada (evita un destello con el tema equivocado) */
+:root:not(.ready) #fence { visibility: hidden; }
+
+* { box-sizing: border-box; -webkit-user-select: none; user-select: none; }
+html, body {
+  margin: 0; height: 100%; overflow: hidden; background: transparent; color: var(--text);
+  font: 12px/1.25 var(--font);
+}
+
+#fence {
+  position: relative; height: 100%; display: flex; flex-direction: column; overflow: hidden;
+  border-radius: var(--radius); border: 1px solid var(--border);
+  background: none;
+  box-shadow: var(--rim), var(--glow);
+}
+#fence.dropping { box-shadow: inset 0 0 0 2px var(--accent); }
+#fence.deny { box-shadow: inset 0 0 0 2px #ef4b5f; }
+
+/* ---------- barra de título (zona arrastrable) ---------- */
+#bar {
+  flex: 0 0 36px; height: 36px; display: flex; align-items: center; gap: 6px; padding: 0 6px 0 12px;
+  -webkit-app-region: drag; color: var(--hdr-text); text-shadow: var(--hdr-shadow);
+  --tint-layer: linear-gradient(rgba(var(--accent-rgb), var(--hdr-tint)), rgba(var(--accent-rgb), var(--hdr-tint)));
+}
+/* normal: color de acento sobre el fondo */
+:root[data-hdr="tint"] #bar { background: var(--shine), var(--tint-layer), rgba(var(--surface), var(--alpha)); }
+/* sólida: igual que la normal pero sin transparencia */
+:root[data-hdr="solid"] #bar { background: var(--shine), var(--tint-layer), rgb(var(--surface)); }
+/* translúcida: deja ver el escritorio a medias */
+:root[data-hdr="glass"] #bar {
+  background:
+    var(--gloss),
+    linear-gradient(rgba(var(--accent-rgb), 0.14), rgba(var(--accent-rgb), 0.14)),
+    rgba(var(--surface), max(calc(var(--alpha) * var(--hdr-k)), var(--glass-min)));
+  border-bottom: 1px solid var(--bar-line);
+}
+/* transparente: casi solo se ve el texto */
+:root[data-hdr="clear"] #bar {
+  background: var(--shine), rgba(var(--surface), max(calc(var(--alpha) * var(--hdr-clear)), var(--clear-min)));
+  border-bottom: 1px solid var(--bar-line);
+}
+:root[data-theme="light"][data-hdr="glass"] #bar,
+:root[data-theme="light"][data-hdr="clear"] #bar {
+  /* solo con relieve: texto oscuro con un halo claro (en el acabado plano --hdr-halo es "none") */
+  text-shadow: var(--hdr-halo);
+}
+/* propia del tema (por ejemplo Alto contraste o Retro 95) */
+:root[data-hdr="custom"] #bar { background: var(--hdr-bg); }
+#title {
+  font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+#titleInput {
+  -webkit-app-region: no-drag; -webkit-user-select: text; user-select: text; flex: 1; min-width: 0;
+  font: inherit; font-weight: 600; font-size: 13px; color: var(--hdr-text); background: var(--input-bg);
+  border: 1px solid rgba(var(--accent-rgb), 0.9); border-radius: 5px; padding: 2px 6px; outline: none;
+}
+.spacer { flex: 1; }
+#badges { display: flex; gap: 5px; align-items: center; }
+.badge { -webkit-app-region: no-drag; display: grid; place-items: center; opacity: 0.85; }
+.badge svg { display: block; }
+.tool {
+  -webkit-app-region: no-drag; width: 26px; height: 26px; border: 0; border-radius: 6px; padding: 0;
+  background: transparent; color: inherit; display: grid; place-items: center; cursor: pointer; opacity: 0.75;
+  transition: background 0.12s, opacity 0.12s;
+}
+.tool:hover { background: var(--tool-hover); opacity: 1; }
+.tool[hidden] { display: none; }
+
+/* ---------- cuerpo ---------- */
+#body { position: relative; flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto; padding: 8px; background: var(--fence-bg); }
+:root.collapsed #body, :root.collapsed #grip { visibility: hidden; }
+#body::-webkit-scrollbar { width: 10px; }
+#body::-webkit-scrollbar-thumb {
+  background: rgba(128, 138, 160, 0.5); border-radius: 6px; border: 3px solid transparent; background-clip: padding-box;
+}
+#items:focus { outline: none; }
+#items.grid { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 2px; min-height: 100%; }
+#items.list { display: block; min-height: 100%; }
+
+.item {
+  position: relative; width: calc(var(--icon) + 46px); padding: 6px 3px 5px; border-radius: 7px;
+  text-align: center; cursor: default; transition: background 0.1s;
+}
+.item:hover { background: var(--hover); }
+.item.selected { background: var(--sel); box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.75); }
+.item.missing { opacity: 0.45; }
+.item.missing .lbl { text-decoration: line-through; }
+.item.dragging { opacity: 0.4; }
+.ico {
+  display: block; width: var(--icon); height: var(--icon); margin: 0 auto 4px; object-fit: contain;
+  border-radius: 8px; background: rgba(128, 138, 160, 0.18); filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.3));
+}
+.ico.loaded { background: transparent; }
+.lbl {
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  word-break: break-word; text-shadow: var(--label-shadow);
+}
+#fence.nolabels .lbl { display: none; }
+.rename {
+  -webkit-user-select: text; user-select: text; width: 100%; font: inherit; text-align: center; color: var(--text);
+  background: var(--input-bg); border: 1px solid rgba(var(--accent-rgb), 0.9); border-radius: 4px; padding: 1px 3px; outline: none;
+}
+
+/* vista de lista */
+.list .item { display: flex; align-items: center; gap: 9px; width: auto; padding: 4px 8px; text-align: left; }
+.list .ico { width: 22px; height: 22px; margin: 0; border-radius: 5px; flex: none; }
+.list .lbl { -webkit-line-clamp: 1; flex: 1; min-width: 0; }
+#fence.nolabels .list .lbl { display: block; }
+
+/* marcador de inserción al reordenar */
+.item.drop-before::before, .item.drop-after::after {
+  content: ""; position: absolute; top: 4px; bottom: 4px; width: 3px; border-radius: 2px; background: var(--accent);
+}
+.item.drop-before::before { left: -2px; }
+.item.drop-after::after { right: -2px; }
+.list .item.drop-before::before, .list .item.drop-after::after { left: 6px; right: 6px; width: auto; height: 3px; top: auto; bottom: auto; }
+.list .item.drop-before::before { top: -2px; }
+.list .item.drop-after::after { bottom: -2px; }
+
+/* ---------- estados ---------- */
+#empty {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; padding: 18px; text-align: center; color: var(--muted); pointer-events: none;
+}
+#empty[hidden] { display: none; }
+#empty p { margin: 0; line-height: 1.45; max-width: 220px; }
+#grip {
+  position: absolute; right: 3px; bottom: 3px; width: 12px; height: 12px; opacity: 0.32; pointer-events: none;
+  background: linear-gradient(135deg, transparent 52%, currentColor 52%, currentColor 60%, transparent 60%, transparent 72%, currentColor 72%, currentColor 80%, transparent 80%);
+}
+#dropHint {
+  position: absolute; inset: 36px 0 0 0; display: none; align-items: center; justify-content: center; z-index: 5;
+  font-weight: 600; text-align: center; padding: 12px; pointer-events: none;
+  background: rgba(var(--accent-rgb), 0.2);
+}
+#fence.dropping #dropHint, #fence.deny #dropHint { display: flex; }
+#fence.deny #dropHint { background: rgba(239, 75, 95, 0.22); }
+#toast {
+  position: absolute; left: 10px; right: 10px; bottom: 10px; z-index: 9; padding: 7px 10px; border-radius: 8px;
+  background: rgba(15, 18, 28, 0.94); color: #fff; font-size: 11.5px; line-height: 1.35;
+  opacity: 0; transform: translateY(6px); transition: opacity 0.18s, transform 0.18s; pointer-events: none;
+}
+#toast.show { opacity: 1; transform: none; }

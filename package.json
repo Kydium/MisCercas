@@ -1,0 +1,7 @@
+{
+  "name": "mis-cercas",
+  "version": "3.0.0-rust.1",
+  "private": true,
+  "scripts": { "tauri": "tauri" },
+  "devDependencies": { "@tauri-apps/cli": "^2" }
+}

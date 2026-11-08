@@ -1,0 +1,48 @@
+name: build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - name: Compilar
+        shell: bash
+        run: npx tauri build 2>&1 | tee build.log
+      - name: Subir registro
+        if: always()
+        shell: bash
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.com
+          mkdir ../logs && cp build.log ../logs/ || true
+          cd ..
+          git clone --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" logrepo
+          cd logrepo
+          git checkout --orphan ci-logs
+          git rm -rf . > /dev/null 2>&1 || true
+          cp ../logs/build.log .
+          git add build.log
+          git commit -m "log ${{ github.sha }}"
+          git push -f origin ci-logs
+      - name: Publicar instalador
+        if: success()
+        shell: bash
+        run: |
+          f=$(ls src-tauri/target/release/bundle/nsis/*.exe | head -1)
+          gh release delete "test-${{ github.run_number }}" -y 2>/dev/null || true
+          gh release create "test-${{ github.run_number }}" "$f" --title "Mis Cercas (Rust) prueba ${{ github.run_number }}" --notes "Versión de prueba del motor en Rust." --prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}

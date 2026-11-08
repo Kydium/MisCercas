@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="es" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost">
+  <title>Cerca</title>
+  <link rel="stylesheet" href="fence.css">
+</head>
+<body>
+  <div id="fence">
+    <header id="bar">
+      <span id="badges"></span>
+      <span id="title"></span>
+      <span class="spacer"></span>
+      <button class="tool" id="btnRoll" title="Enrollar / desenrollar"></button>
+      <button class="tool" id="btnMenu" title="Opciones de la cerca"></button>
+    </header>
+    <main id="body">
+      <div id="items" tabindex="0"></div>
+      <div id="empty" hidden>
+        <svg viewBox="0 0 48 48" width="38" height="38" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="5 4">
+          <rect x="6" y="8" width="36" height="32" rx="7"/>
+        </svg>
+        <p></p>
+      </div>
+    </main>
+    <div id="grip"></div>
+    <div id="dropHint"></div>
+    <div id="toast" role="status"></div>
+  </div>
+  <script src="themes.js"></script>
+  <script src="tauri-shim.js"></script>
+  <script src="fence.js"></script>
+</body>
+</html>

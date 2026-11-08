@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="es" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'">
+  <title>Configuración</title>
+  <link rel="stylesheet" href="settings.css">
+</head>
+<body>
+  <main>
+    <header class="top">
+      <img src="../../assets/icon.png" alt="" width="46" height="46">
+      <div>
+        <h1>Mis Cercas</h1>
+        <p id="version" class="muted"></p>
+      </div>
+    </header>
+
+    <section class="card">
+      <h2>General</h2>
+      <div class="row">
+        <div class="txt"><b>Iniciar con Windows</b><span>Abre las cercas al encender el equipo.</span></div>
+        <label class="switch"><input type="checkbox" id="autoStart"><i></i></label>
+      </div>
+      <div class="row">
+        <div class="txt"><b>Atajo para mostrar u ocultar</b><span>Funciona en cualquier programa.</span></div>
+        <button class="btn key" id="hotkey" type="button"></button>
+      </div>
+      <div class="row">
+        <div class="txt"><b>Animaciones</b><span>Al enrollar y desenrollar las cercas.</span></div>
+        <label class="switch"><input type="checkbox" id="animations"><i></i></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Apariencia</h2>
+      <div class="row">
+        <div class="txt"><b>Tema</b><span id="themeNote"></span></div>
+        <select id="themeSelect" class="sel"></select>
+      </div>
+      <div class="row">
+        <div class="txt"><b>Color de acento</b><span id="accentNote"></span></div>
+        <div class="swatches" id="accent"></div>
+      </div>
+      <div class="row stack">
+        <div class="txt"><b>Barra de título</b><span>Qué tan transparente es la barra superior de cada cerca.</span></div>
+        <div class="seg" id="titlebar">
+          <button data-v="theme" type="button">Según el tema</button>
+          <button data-v="solid" type="button">Sólida</button>
+          <button data-v="glass" type="button">Translúcida</button>
+          <button data-v="clear" type="button">Transparente</button>
+        </div>
+      </div>
+      <div class="row stack">
+        <div class="txt"><b>Acabado</b><span>Plano: colores lisos, sin brillos ni sombras. Con relieve: brillo, borde luminoso y sombra en el título.</span></div>
+        <div class="seg" id="finish">
+          <button data-v="flat" type="button">Plano</button>
+          <button data-v="raised" type="button">Con relieve</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="txt"><b>Transparencia del fondo</b></div>
+        <div class="slider"><input type="range" id="opacity" min="20" max="95" step="1"><output id="opacityOut"></output></div>
+      </div>
+      <div class="row">
+        <div class="txt"><b>Esquinas redondeadas</b></div>
+        <div class="slider"><input type="range" id="radius" min="0" max="22" step="1"><output id="radiusOut"></output></div>
+      </div>
+      <div class="row">
+        <div class="txt"><b>Tamaño de iconos</b></div>
+        <div class="seg" id="iconSize">
+          <button data-v="28" type="button">Pequeño</button>
+          <button data-v="40" type="button">Mediano</button>
+          <button data-v="52" type="button">Grande</button>
+          <button data-v="64" type="button">Enorme</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="txt"><b>Mostrar nombres</b></div>
+        <label class="switch"><input type="checkbox" id="showLabels"><i></i></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Comportamiento</h2>
+      <div class="row">
+        <div class="txt"><b>Abrir elementos con</b></div>
+        <div class="seg" id="openWith">
+          <button data-v="double" type="button">Doble clic</button>
+          <button data-v="single" type="button">Un clic</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="txt"><b>Enrollar al salir el ratón</b><span>Valor inicial para las cercas nuevas.</span></div>
+        <label class="switch"><input type="checkbox" id="defaultAutoRoll"><i></i></label>
+      </div>
+      <div class="row">
+        <div class="txt"><b>Ocultar del Escritorio lo que está en una cerca</b><span>Los accesos directos y archivos del Escritorio que pongas en una cerca dejan de verse allí (no se borran ni se mueven). Al sacarlos de la cerca, o al desactivar esto, vuelven a verse. Si en el Explorador tienes activado «Elementos ocultos», se verán atenuados.</span></div>
+        <label class="switch"><input type="checkbox" id="hideDesktop"><i></i></label>
+      </div>
+      <div class="row">
+        <div class="txt"><b>Imán entre cercas</b><span>Al soltar o cambiar el tamaño de una cerca, se alinea con los bordes de las demás y con el borde de la pantalla.</span></div>
+        <label class="switch"><input type="checkbox" id="snap"><i></i></label>
+      </div>
+      <div class="row">
+        <div class="txt"><b>Cercas siempre al frente</b><span>Actívalo si «Mostrar escritorio» (Win+D) las oculta. Quedan por encima de todas las ventanas.</span></div>
+        <label class="switch"><input type="checkbox" id="keepOnTop"><i></i></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Datos</h2>
+      <p class="muted small" id="dataDir"></p>
+      <div class="buttons">
+        <button class="btn" data-act="export" type="button">Exportar…</button>
+        <button class="btn" data-act="import" type="button">Importar…</button>
+        <button class="btn" data-act="openFolder" type="button">Abrir carpeta de datos</button>
+        <button class="btn" data-act="openLog" type="button">Ver registro</button>
+        <button class="btn danger" data-act="reset" type="button">Restablecer todo…</button>
+      </div>
+    </section>
+  </main>
+  <div id="toast" role="status"></div>
+  <script src="settings.js"></script>
+</body>
+</html>

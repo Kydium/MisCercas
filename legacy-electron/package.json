@@ -1,0 +1,73 @@
+{
+  "name": "mis-cercas",
+  "productName": "Mis Cercas",
+  "version": "2.3.0",
+  "description": "Organiza tu escritorio de Windows con cercas, portales de carpeta y disposiciones guardadas.",
+  "author": "Michael Tellez Oviedo",
+  "license": "MIT",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "node scripts/pack.js",
+    "dist": "electron-builder --win nsis --x64",
+    "dist:portable": "electron-builder --win portable --x64 -c.directories.output=dist-portable"
+  },
+  "devDependencies": {
+    "@electron/packager": "^18.3.6",
+    "electron": "33.3.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.michael.miscercas",
+    "productName": "Mis Cercas",
+    "copyright": "© Michael Tellez Oviedo",
+    "directories": {
+      "output": "dist-installer"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "asar": false,
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Mis Cercas",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "uninstallDisplayName": "Mis Cercas",
+      "installerLanguages": [
+        "es_ES",
+        "en_US"
+      ],
+      "artifactName": "MisCercas-Setup-${version}.exe"
+    },
+    "portable": {
+      "artifactName": "MisCercas-portable.exe"
+    },
+    "publish": null,
+    "electronLanguages": [
+      "en-US",
+      "es",
+      "es-419"
+    ],
+    "compression": "maximum"
+  }
+}
