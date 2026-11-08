@@ -339,7 +339,7 @@ fn portal_list(state: State<AppState>, id: String) -> Value {
 }
 
 #[tauri::command]
-fn app_action(app: AppHandle, state: State<AppState>, id: String, name: String) {
+async fn app_action(app: AppHandle, state: State<'_, AppState>, id: String, name: String) -> Result<(), ()> {
     match name.as_str() {
         "settings" => open_settings(&app),
         "newFence" => add_fence(&app, Some(&id)),
@@ -347,9 +347,9 @@ fn app_action(app: AppHandle, state: State<AppState>, id: String, name: String) 
         "toggleRoll" => {
             let (collapsed, w, h) = {
                 let mut d = state.data.lock().unwrap();
-                let Some(f) = d.fences.iter_mut().find(|f| f.id == id) else { return };
+                let Some(f) = d.fences.iter_mut().find(|f| f.id == id) else { return Ok(()) };
                 if f.auto_roll {
-                    return;
+                    return Ok(());
                 }
                 f.rolled = !f.rolled;
                 (f.rolled, f.w, f.h)
@@ -364,6 +364,7 @@ fn app_action(app: AppHandle, state: State<AppState>, id: String, name: String) 
         }
         _ => {}
     }
+    Ok(())
 }
 
 #[tauri::command]
@@ -379,7 +380,7 @@ fn data_action(state: State<AppState>, name: String) -> Value {
 
 // Pendientes de portar (menús contextuales, mover entre cercas, sacar al Escritorio)
 #[tauri::command]
-fn fence_menu(app: AppHandle, id: String) {
+async fn fence_menu(app: AppHandle, id: String) {
     let _ = id;
     open_settings(&app);
 }
