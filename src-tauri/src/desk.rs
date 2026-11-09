@@ -207,6 +207,20 @@ pub mod guard {
             loop {
                 std::thread::sleep(Duration::from_millis(80));
                 let state = app.state::<crate::AppState>();
+                // Win+D puede minimizar alguna cerca: se restaura sin quitarle el foco a nadie
+                if !state.all_hidden.load(std::sync::atomic::Ordering::SeqCst) {
+                    for w in crate::fence_windows(&app) {
+                        if let Some(h) = raw(&w) {
+                            unsafe {
+                                if IsIconic(h).as_bool() {
+                                    let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+                                    let _ = SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, FLAGS);
+                                    raised.insert(w.label().to_string(), Instant::now());
+                                }
+                            }
+                        }
+                    }
+                }
                 if covers(anchor) {
                     off = 0;
                     shown = true;
