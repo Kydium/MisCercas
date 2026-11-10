@@ -99,15 +99,40 @@ pub fn sync(data: &mut Data, user_desktop: Option<PathBuf>) -> bool {
 /* ---------- «Mostrar escritorio» (Win+D) ---------- */
 #[cfg(windows)]
 pub mod guard {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
     use tauri::{AppHandle, Manager};
     use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::{HINSTANCE, HWND};
+    use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     const FLAGS: SET_WINDOW_POS_FLAGS = SET_WINDOW_POS_FLAGS(SWP_NOSIZE.0 | SWP_NOMOVE.0 | SWP_NOACTIVATE.0);
+    static LINES: AtomicU32 = AtomicU32::new(0);
 
+    fn log(app: &AppHandle, msg: String) {
+        if LINES.fetch_add(1, Ordering::SeqCst) > 400 {
+            return;
+        }
+        let st = app.state::<crate::AppState>();
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(st.dir.join("guard.log")) {
+            use std::io::Write;
+            let _ = writeln!(f, "[{t}] {msg}");
+        }
+    }
+
+    fn class_of(h: HWND) -> String {
+        let mut buf = [0u16; 64];
+        let n = unsafe { GetClassNameW(h, &mut buf) };
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+
+    fn is_top(h: HWND) -> bool {
+        unsafe { (GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0 }
+    }
+
+    /// Ventanas que forman el escritorio: Program Manager y las WorkerW visibles.
     fn hosts() -> HashSet<isize> {
         let mut v = HashSet::new();
         unsafe {
@@ -118,7 +143,7 @@ pub mod guard {
             }
             let mut cur = HWND::default();
             for _ in 0..24 {
-                match FindWindowExW(None, cur, w!("WorkerW"), PCWSTR::null()) {
+                match FindWindowExW(HWND::default(), cur, w!("WorkerW"), PCWSTR::null()) {
                     Ok(h) if !h.0.is_null() => {
                         if IsWindowVisible(h).as_bool() {
                             v.insert(h.0 as isize);
@@ -132,12 +157,9 @@ pub mod guard {
         v
     }
 
-    fn covers(anchor: HWND) -> bool {
-        let hs = hosts();
-        if hs.is_empty() {
-            return false;
-        }
-        let mut cur = anchor;
+    /// ¿Hay alguna ventana del escritorio por encima de `h` en el orden de ventanas?
+    fn host_above(h: HWND, hs: &HashSet<isize>) -> bool {
+        let mut cur = h;
         unsafe {
             for _ in 0..3000 {
                 match GetWindow(cur, GW_HWNDPREV) {
@@ -152,12 +174,6 @@ pub mod guard {
             }
         }
         false
-    }
-
-    fn raise(h: HWND) {
-        unsafe {
-            let _ = SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, FLAGS);
-        }
     }
 
     fn lower(h: HWND) {
@@ -188,24 +204,20 @@ pub mod guard {
         }
     }
 
-    /// Sube varias ventanas a la vez (en el hilo principal, que es el dueño de las ventanas, y de una sola pasada).
+    /// Sube las cercas al primer plano (aunque ya fueran «siempre encima» pero quedaran bajo el escritorio).
     fn raise_all(app: &AppHandle, hs: Vec<isize>) {
         if hs.is_empty() {
             return;
         }
+        let app2 = app.clone();
         let _ = app.run_on_main_thread(move || unsafe {
-            if let Ok(mut hdwp) = BeginDeferWindowPos(hs.len() as i32) {
-                for h in &hs {
-                    match DeferWindowPos(hdwp, HWND(*h as *mut _), HWND_TOPMOST, 0, 0, 0, 0, FLAGS) {
-                        Ok(n) => hdwp = n,
-                        Err(_) => break,
-                    }
+            for h in hs {
+                let h = HWND(h as *mut _);
+                if is_top(h) {
+                    let _ = SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, FLAGS);
                 }
-                let _ = EndDeferWindowPos(hdwp);
-            }
-            for h in &hs {
-                if (GetWindowLongW(HWND(*h as *mut _), GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) == 0 {
-                    let _ = SetWindowPos(HWND(*h as *mut _), HWND_TOPMOST, 0, 0, 0, 0, FLAGS);
+                if SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, FLAGS).is_err() {
+                    log(&app2, format!("SetWindowPos falló en {:?}: error {}", h.0, GetLastError().0));
                 }
             }
         });
@@ -223,34 +235,28 @@ pub mod guard {
         w.hwnd().ok().map(|h| HWND(h.0 as *mut _))
     }
 
-    fn log(app: &AppHandle, lines: &mut u32, msg: String) {
-        if *lines > 300 {
-            return;
-        }
-        *lines += 1;
-        let st = app.state::<crate::AppState>();
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(st.dir.join("guard.log")) {
-            use std::io::Write;
-            let _ = writeln!(f, "[{t}] {msg}");
-        }
-    }
-
     fn states(app: &AppHandle) -> String {
-        crate::fence_windows(app)
+        let hs = hosts();
+        let hosts_txt = hs.iter().map(|h| format!("{}:top={}", class_of(HWND(*h as *mut _)), is_top(HWND(*h as *mut _)) as u8)).collect::<Vec<_>>().join(",");
+        let fg = unsafe { GetForegroundWindow() };
+        let fences = crate::fence_windows(app)
             .iter()
-            .map(|w| {
-                let h = raw(w);
-                let (vis, ico, top) = match h {
-                    Some(h) => unsafe {
-                        (IsWindowVisible(h).as_bool(), IsIconic(h).as_bool(), (GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0)
-                    },
-                    None => (false, false, false),
-                };
-                format!("{}:vis={} ico={} top={}", w.label(), vis as u8, ico as u8, top as u8)
+            .map(|w| match raw(w) {
+                Some(h) => unsafe {
+                    format!(
+                        "{}:vis={} ico={} top={} bajoEscritorio={}",
+                        &w.label()[w.label().len().saturating_sub(4)..],
+                        IsWindowVisible(h).as_bool() as u8,
+                        IsIconic(h).as_bool() as u8,
+                        is_top(h) as u8,
+                        host_above(h, &hs) as u8
+                    )
+                },
+                None => "?".into(),
             })
             .collect::<Vec<_>>()
-            .join(" | ")
+            .join(" | ");
+        format!("primer plano={} escritorios=[{}] {}", class_of(fg), hosts_txt, fences)
     }
 
     pub fn start(app: AppHandle) {
@@ -262,39 +268,38 @@ pub mod guard {
                 eprintln!("No se pudo crear la ventana de referencia para «Mostrar escritorio».");
                 return;
             };
-            let mut raised: HashMap<String, Instant> = HashMap::new();
-            let mut shown = false;
+            let mut raised = HashSet::<String>::new();
+            let mut shown_at: Option<Instant> = None;
+            let mut sampled = 0u8;
             let mut off = 0;
-            let mut lines = 0u32;
-            let mut rescued = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_millis(50));
                 let state = app.state::<crate::AppState>();
-                let hidden_by_user = state.all_hidden.load(std::sync::atomic::Ordering::SeqCst);
-                // Una cerca minimizada u oculta por Windows se vuelve a mostrar sin quitarle el foco a nadie
+                let hidden_by_user = state.all_hidden.load(Ordering::SeqCst);
+                let hs = hosts();
+                // desde el anclaje hacia arriba: ¿hay un escritorio encima?
+                let covers = host_above(anchor, &hs);
                 if !hidden_by_user {
+                    // una cerca minimizada u oculta por Windows se vuelve a mostrar sin quitar el foco
                     for w in crate::fence_windows(&app) {
                         if let Some(h) = raw(&w) {
                             unsafe {
-                                let iconic = IsIconic(h).as_bool();
-                                if iconic || !IsWindowVisible(h).as_bool() {
-                                    if rescued.elapsed() > Duration::from_millis(500) {
-                                        log(&app, &mut lines, format!("rescate {} iconic={}", w.label(), iconic));
-                                        rescued = Instant::now();
-                                    }
+                                if IsIconic(h).as_bool() || !IsWindowVisible(h).as_bool() {
+                                    log(&app, format!("rescate {}", w.label()));
                                     let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
                                     let _ = SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, FLAGS);
-                                    raised.insert(w.label().to_string(), Instant::now());
+                                    raised.insert(w.label().to_string());
                                 }
                             }
                         }
                     }
                 }
-                if covers(anchor) {
+                if covers {
                     off = 0;
-                    if !shown {
-                        shown = true;
-                        log(&app, &mut lines, format!("escritorio encima; {}", states(&app)));
+                    if shown_at.is_none() {
+                        shown_at = Some(Instant::now());
+                        sampled = 0;
+                        log(&app, format!("escritorio encima; {}", states(&app)));
                     }
                     if hidden_by_user {
                         continue;
@@ -302,31 +307,39 @@ pub mod guard {
                     let mut todo = vec![];
                     for w in crate::fence_windows(&app) {
                         if let Some(h) = raw(&w) {
-                            let top = unsafe { (GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0 };
-                            if !top {
+                            if !is_top(h) || host_above(h, &hs) {
                                 todo.push(h.0 as isize);
-                                raised.insert(w.label().to_string(), Instant::now());
+                                raised.insert(w.label().to_string());
                             }
                         }
                     }
+                    if !todo.is_empty() {
+                        log(&app, format!("subiendo {} cerca(s)", todo.len()));
+                    }
                     raise_all(&app, todo);
-                } else if shown {
+                    if let Some(t) = shown_at {
+                        let ms = t.elapsed().as_millis();
+                        if (sampled == 0 && ms > 250) || (sampled == 1 && ms > 1000) {
+                            sampled += 1;
+                            log(&app, format!("durante ({ms} ms); {}", states(&app)));
+                        }
+                    }
+                } else if shown_at.is_some() {
                     off += 1;
                     if off >= 10 {
-                        shown = false;
+                        shown_at = None;
                         off = 0;
-                        log(&app, &mut lines, format!("escritorio detrás; {}", states(&app)));
-                        let mut hs = vec![];
+                        log(&app, format!("escritorio detrás; {}", states(&app)));
+                        let mut hl = vec![];
                         for w in crate::fence_windows(&app) {
-                            if raised.contains_key(w.label()) && !w.is_always_on_top().unwrap_or(false) {
+                            if raised.contains(w.label()) && !w.is_always_on_top().unwrap_or(false) {
                                 if let Some(h) = raw(&w) {
-                                    hs.push(h.0 as isize);
+                                    hl.push(h.0 as isize);
                                 }
                             }
                         }
-                        lower_all(&app, hs);
+                        lower_all(&app, hl);
                         raised.clear();
-                        log(&app, &mut lines, format!("tras bajar; {}", states(&app)));
                     }
                 }
             }
