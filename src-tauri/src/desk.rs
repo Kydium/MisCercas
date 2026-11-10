@@ -192,6 +192,36 @@ pub mod guard {
         w.hwnd().ok().map(|h| HWND(h.0 as *mut _))
     }
 
+    fn log(app: &AppHandle, lines: &mut u32, msg: String) {
+        if *lines > 300 {
+            return;
+        }
+        *lines += 1;
+        let st = app.state::<crate::AppState>();
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(st.dir.join("guard.log")) {
+            use std::io::Write;
+            let _ = writeln!(f, "[{t}] {msg}");
+        }
+    }
+
+    fn states(app: &AppHandle) -> String {
+        crate::fence_windows(app)
+            .iter()
+            .map(|w| {
+                let h = raw(w);
+                let (vis, ico, top) = match h {
+                    Some(h) => unsafe {
+                        (IsWindowVisible(h).as_bool(), IsIconic(h).as_bool(), (GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0)
+                    },
+                    None => (false, false, false),
+                };
+                format!("{}:vis={} ico={} top={}", w.label(), vis as u8, ico as u8, top as u8)
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
     pub fn start(app: AppHandle) {
         std::thread::spawn(move || {
             let anchor = unsafe {
@@ -204,15 +234,23 @@ pub mod guard {
             let mut raised: HashMap<String, Instant> = HashMap::new();
             let mut shown = false;
             let mut off = 0;
+            let mut lines = 0u32;
+            let mut rescued = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_millis(80));
                 let state = app.state::<crate::AppState>();
-                // Win+D puede minimizar alguna cerca: se restaura sin quitarle el foco a nadie
-                if !state.all_hidden.load(std::sync::atomic::Ordering::SeqCst) {
+                let hidden_by_user = state.all_hidden.load(std::sync::atomic::Ordering::SeqCst);
+                // Una cerca minimizada u oculta por Windows se vuelve a mostrar sin quitarle el foco a nadie
+                if !hidden_by_user {
                     for w in crate::fence_windows(&app) {
                         if let Some(h) = raw(&w) {
                             unsafe {
-                                if IsIconic(h).as_bool() {
+                                let iconic = IsIconic(h).as_bool();
+                                if iconic || !IsWindowVisible(h).as_bool() {
+                                    if rescued.elapsed() > Duration::from_millis(500) {
+                                        log(&app, &mut lines, format!("rescate {} iconic={}", w.label(), iconic));
+                                        rescued = Instant::now();
+                                    }
                                     let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
                                     let _ = SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, FLAGS);
                                     raised.insert(w.label().to_string(), Instant::now());
@@ -223,21 +261,20 @@ pub mod guard {
                 }
                 if covers(anchor) {
                     off = 0;
-                    shown = true;
-                    if state.all_hidden.load(std::sync::atomic::Ordering::SeqCst) {
+                    if !shown {
+                        shown = true;
+                        log(&app, &mut lines, format!("escritorio encima; {}", states(&app)));
+                    }
+                    if hidden_by_user {
                         continue;
                     }
                     for w in crate::fence_windows(&app) {
-                        if w.is_always_on_top().unwrap_or(false) {
-                            continue;
-                        }
-                        let id = w.label().to_string();
-                        if raised.get(&id).map(|t| t.elapsed() < Duration::from_millis(800)).unwrap_or(false) {
-                            continue;
-                        }
                         if let Some(h) = raw(&w) {
-                            raise(h);
-                            raised.insert(id, Instant::now());
+                            let top = unsafe { (GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0 };
+                            if !top {
+                                raise(h);
+                                raised.insert(w.label().to_string(), Instant::now());
+                            }
                         }
                     }
                 } else if shown {
@@ -245,14 +282,16 @@ pub mod guard {
                     if off >= 2 {
                         shown = false;
                         off = 0;
+                        log(&app, &mut lines, format!("escritorio detrás; {}", states(&app)));
                         for w in crate::fence_windows(&app) {
-                            if raised.contains_key(w.label()) {
+                            if raised.contains_key(w.label()) && !w.is_always_on_top().unwrap_or(false) {
                                 if let Some(h) = raw(&w) {
                                     lower(h);
                                 }
                             }
                         }
                         raised.clear();
+                        log(&app, &mut lines, format!("tras bajar; {}", states(&app)));
                     }
                 }
             }

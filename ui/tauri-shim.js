@@ -22,6 +22,7 @@
   window.api = {
     state: async () => {
       const s = await invoke('state_get', { id: myId });
+      if (s && s.fence) window.__fenceLocked = !!s.fence.locked;
       return s ? withTheme(s) : s;
     },
     patch: (patch) => invoke('fence_patch', { id: myId, patch }),
@@ -55,9 +56,12 @@
 
   // Arrastrar la cerca por la barra y cambiar tamaño desde la esquina
   document.addEventListener('DOMContentLoaded', () => {
-    for (const sel of ['#bar', '#title', '#badges', '#bar .spacer']) {
-      document.querySelectorAll(sel).forEach((el) => el.setAttribute('data-tauri-drag-region', ''));
-    }
+    // Arrastrar la cerca por la barra (no si está bloqueada)
+    document.addEventListener('mousedown', (e) => {
+      if (e.button !== 0 || e.detail !== 1 || window.__fenceLocked) return;
+      if (!e.target.closest || !e.target.closest('#bar') || e.target.closest('button, input')) return;
+      T.window.getCurrentWindow().startDragging();
+    });
     const grip = document.getElementById('grip');
     if (grip && T.window) {
       grip.addEventListener('mousedown', (e) => {
