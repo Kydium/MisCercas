@@ -57,7 +57,7 @@ html, body {
 /* ---------- barra de título (zona arrastrable) ---------- */
 #bar {
   flex: 0 0 36px; height: 36px; display: flex; align-items: center; gap: 6px; padding: 0 6px 0 12px;
-  -webkit-app-region: drag; color: var(--hdr-text); text-shadow: var(--hdr-shadow);
+  -webkit-app-region: no-drag; color: var(--hdr-text); text-shadow: var(--hdr-shadow);
   --tint-layer: linear-gradient(rgba(var(--accent-rgb), var(--hdr-tint)), rgba(var(--accent-rgb), var(--hdr-tint)));
 }
 /* normal: color de acento sobre el fondo */

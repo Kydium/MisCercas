@@ -188,6 +188,37 @@ pub mod guard {
         }
     }
 
+    /// Sube varias ventanas a la vez (en el hilo principal, que es el dueño de las ventanas, y de una sola pasada).
+    fn raise_all(app: &AppHandle, hs: Vec<isize>) {
+        if hs.is_empty() {
+            return;
+        }
+        let _ = app.run_on_main_thread(move || unsafe {
+            if let Ok(mut hdwp) = BeginDeferWindowPos(hs.len() as i32) {
+                for h in &hs {
+                    match DeferWindowPos(hdwp, HWND(*h as *mut _), HWND_TOPMOST, 0, 0, 0, 0, FLAGS) {
+                        Ok(n) => hdwp = n,
+                        Err(_) => break,
+                    }
+                }
+                let _ = EndDeferWindowPos(hdwp);
+            }
+            for h in &hs {
+                if (GetWindowLongW(HWND(*h as *mut _), GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) == 0 {
+                    let _ = SetWindowPos(HWND(*h as *mut _), HWND_TOPMOST, 0, 0, 0, 0, FLAGS);
+                }
+            }
+        });
+    }
+
+    fn lower_all(app: &AppHandle, hs: Vec<isize>) {
+        let _ = app.run_on_main_thread(move || {
+            for h in hs {
+                lower(HWND(h as *mut _));
+            }
+        });
+    }
+
     fn raw(w: &tauri::WebviewWindow) -> Option<HWND> {
         w.hwnd().ok().map(|h| HWND(h.0 as *mut _))
     }
@@ -237,7 +268,7 @@ pub mod guard {
             let mut lines = 0u32;
             let mut rescued = Instant::now();
             loop {
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(Duration::from_millis(50));
                 let state = app.state::<crate::AppState>();
                 let hidden_by_user = state.all_hidden.load(std::sync::atomic::Ordering::SeqCst);
                 // Una cerca minimizada u oculta por Windows se vuelve a mostrar sin quitarle el foco a nadie
@@ -268,28 +299,32 @@ pub mod guard {
                     if hidden_by_user {
                         continue;
                     }
+                    let mut todo = vec![];
                     for w in crate::fence_windows(&app) {
                         if let Some(h) = raw(&w) {
                             let top = unsafe { (GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0 };
                             if !top {
-                                raise(h);
+                                todo.push(h.0 as isize);
                                 raised.insert(w.label().to_string(), Instant::now());
                             }
                         }
                     }
+                    raise_all(&app, todo);
                 } else if shown {
                     off += 1;
-                    if off >= 2 {
+                    if off >= 10 {
                         shown = false;
                         off = 0;
                         log(&app, &mut lines, format!("escritorio detrás; {}", states(&app)));
+                        let mut hs = vec![];
                         for w in crate::fence_windows(&app) {
                             if raised.contains_key(w.label()) && !w.is_always_on_top().unwrap_or(false) {
                                 if let Some(h) = raw(&w) {
-                                    lower(h);
+                                    hs.push(h.0 as isize);
                                 }
                             }
                         }
+                        lower_all(&app, hs);
                         raised.clear();
                         log(&app, &mut lines, format!("tras bajar; {}", states(&app)));
                     }
