@@ -164,6 +164,7 @@ pub mod guard {
     use tauri::{AppHandle, Manager};
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND};
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     const FLAGS: SET_WINDOW_POS_FLAGS = SET_WINDOW_POS_FLAGS(SWP_NOSIZE.0 | SWP_NOMOVE.0 | SWP_NOACTIVATE.0);
