@@ -36,6 +36,7 @@ impl FState {
 pub struct AppState {
     dir: PathBuf,
     desktop: Option<PathBuf>,
+    store: PathBuf,
     data: Mutex<store::Data>,
     dirty: AtomicBool,
     icons: Mutex<HashMap<String, Option<String>>>,
@@ -49,11 +50,7 @@ impl AppState {
     }
     fn flush(&self) {
         if self.dirty.swap(false, Ordering::SeqCst) {
-            let copy = {
-                let mut d = self.data.lock().unwrap();
-                desk::sync(&mut d, self.desktop.clone());
-                d.clone()
-            };
+            let copy = self.data.lock().unwrap().clone();
             if let Err(e) = store::save(&self.dir, &copy) {
                 eprintln!("No se pudo guardar la configuración: {e}");
             }
@@ -435,6 +432,20 @@ fn patch_fence(app: &AppHandle, id: &str, patch: &Value, notify: bool) -> bool {
         (old, nf)
     };
     state.touch();
+    if patch.get("items").is_some() && new.portal.is_none() {
+        let gone: Vec<String> = {
+            let d = state.data.lock().unwrap();
+            old.items
+                .iter()
+                .filter(|it| !new.items.iter().any(|n| key(&n.p) == key(&it.p)))
+                .filter(|it| !d.fences.iter().any(|f| f.items.iter().any(|n| key(&n.p) == key(&it.p))))
+                .map(|it| it.p.clone())
+                .collect()
+        };
+        for p in gone {
+            desk::give_back(&p, &state.store, state.desktop.clone());
+        }
+    }
     let keep = state.data.lock().unwrap().settings.keep_on_top;
     if let Some(win) = app.get_webview_window(&label(id)) {
         if old.pinned != new.pinned {
@@ -564,7 +575,7 @@ fn replace_everything(app: &AppHandle, mut data: store::Data) {
     }
     {
         let mut d = state.data.lock().unwrap();
-        data.hidden = d.hidden.clone(); // lo que ocultamos antes se vuelve a mostrar si ya no corresponde
+        data.hidden = vec![];
         *d = data.clone();
     }
     state.fs.lock().unwrap().clear();
@@ -677,6 +688,7 @@ fn build_fence_menu(app: &AppHandle, f: &store::Fence, snap: bool) -> Menu<Wry> 
         t.push(item(app, mid(id, "unportal", ""), "Quitar portal (volver a cerca normal)", true));
     } else {
         t.push(sub(app, "Ordenar por", FENCE_SORTS.iter().map(|(k, n)| radio(k, n, f.sort == *k, "sort")).collect()));
+        t.push(item(app, mid(id, "openstore", ""), "Abrir la carpeta de esta cerca", true));
         t.push(item(app, mid(id, "toportal", ""), "Convertir en portal de carpeta…", true));
         t.push(item(app, mid(id, "vaciar", ""), "Vaciar cerca", !f.items.is_empty()));
     }
@@ -701,11 +713,10 @@ fn toggle_of(f: &store::Fence, k: &str) -> Value {
 fn move_item(app: &AppHandle, src: &str, target: Option<&str>, path: &str) -> Option<String> {
     let state = app.state::<AppState>();
     let k = key(path);
-    let result;
+    let mut result;
+    let mut restore = false;
     {
         let mut d = state.data.lock().unwrap();
-        let hide = d.settings.hide_desktop;
-        let dirs = desk::desktop_dirs(state.desktop.clone());
         let s = d.fences.iter().position(|f| f.id == src)?;
         if d.fences[s].portal.is_some() {
             return None;
@@ -723,8 +734,12 @@ fn move_item(app: &AppHandle, src: &str, target: Option<&str>, path: &str) -> Op
             result = "moved".to_string();
         } else {
             d.fences[s].items.remove(i);
-            result = if hide && desk::in_desktop(path, &dirs) { "desktop".into() } else { "removed".to_string() };
+            result = "removed".to_string();
+            restore = true;
         }
+    }
+    if restore && desk::give_back(path, &state.store, state.desktop.clone()).is_some() {
+        result = "desktop".into();
     }
     state.touch();
     let _ = app.emit("reload", json!({ "id": src }));
@@ -794,6 +809,10 @@ fn fence_action(app: &AppHandle, id: &str, action: &str, arg: &str) {
                 }
                 patch_fence(app, id, &json!({ "portal": p }), true);
             }
+        }
+        "openstore" => {
+            let dir = desk::fence_folder(&st.store, &f.title);
+            icons::open(&(if dir.exists() { dir } else { st.store.clone() }).to_string_lossy());
         }
         "openfolder" => {
             if let Some(d) = f.portal.as_ref().and_then(|p| p.dirs.first()) {
@@ -889,8 +908,18 @@ fn settings_set(app: AppHandle, state: State<AppState>, patch: Value) -> Value {
         }
     }
     let settings = store::sanitize_settings(&next);
-    {
-        state.data.lock().unwrap().settings = settings.clone();
+    let moved = {
+        let mut d = state.data.lock().unwrap();
+        let was = d.settings.hide_desktop;
+        d.settings = settings.clone();
+        if settings.hide_desktop && !was {
+            desk::adopt(&mut d, state.desktop.clone(), &state.store, None)
+        } else {
+            vec![]
+        }
+    };
+    for id in moved {
+        let _ = app.emit("reload", json!({ "id": id }));
     }
     state.touch();
     apply_topmost(&app);
@@ -927,7 +956,10 @@ async fn icon_get(state: State<'_, AppState>, path: String, size: Option<i64>, i
     let dir = is_dir.unwrap_or(false);
     let p = path.clone();
     let got = tauri::async_runtime::spawn_blocking(move || icons::get(&p, dir)).await.map_err(|e| e.to_string())?;
-    state.icons.lock().unwrap().insert(k, got.clone());
+    if got.is_some() {
+        // los fallos no se guardan: se vuelve a intentar la próxima vez
+        state.icons.lock().unwrap().insert(k, got.clone());
+    }
     Ok(got)
 }
 
@@ -987,6 +1019,10 @@ fn item_add(app: AppHandle, state: State<AppState>, id: String, paths: Vec<Strin
         f.items.splice(at..at, fresh);
         n
     };
+    if added > 0 {
+        let mut d = state.data.lock().unwrap();
+        desk::adopt(&mut d, state.desktop.clone(), &state.store, Some(&id));
+    }
     if added > 0 {
         state.touch();
         let _ = app.emit("reload", json!({ "id": id }));
@@ -1075,8 +1111,7 @@ async fn item_menu(app: AppHandle, id: String, args: Option<Value>) -> Option<St
     let renamed = index >= 0 && f.items.get(index as usize).map(|i| i.n.is_some()).unwrap_or(false);
     let back = {
         let st = app.state::<AppState>();
-        let hide = st.data.lock().unwrap().settings.hide_desktop;
-        hide && desk::in_desktop(&path, &desk::desktop_dirs(st.desktop.clone()))
+        desk::in_store(&path, &st.store)
     };
     let id2 = id.clone();
     popup(&app, &id2, move |a| {
@@ -1143,10 +1178,11 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let toggle = MenuItem::with_id(app, "toggle", "Mostrar u ocultar cercas", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Configuración…", true, None::<&str>)?;
     let folder = MenuItem::with_id(app, "folder", "Abrir carpeta de datos", true, None::<&str>)?;
+    let store_item = MenuItem::with_id(app, "store", "Abrir carpeta «Mis Cercas» (tus archivos)", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Salir", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&new_item, &toggle, &sep, &settings, &folder, &sep2, &quit])?;
+    let menu = Menu::with_items(app, &[&new_item, &toggle, &sep, &settings, &store_item, &folder, &sep2, &quit])?;
     let mut b = TrayIconBuilder::new().tooltip("Mis Cercas").menu(&menu).show_menu_on_left_click(false);
     if let Some(icon) = app.default_window_icon() {
         b = b.icon(icon.clone());
@@ -1162,6 +1198,11 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             "folder" => {
                 let st = app.state::<AppState>();
                 icons::open(&st.dir.to_string_lossy());
+            }
+            "store" => {
+                let st = app.state::<AppState>();
+                let _ = std::fs::create_dir_all(&st.store);
+                icons::open(&st.store.to_string_lossy());
             }
             "quit" => app.exit(0),
             _ => {}
@@ -1202,11 +1243,17 @@ pub fn run() {
             }
             let keep = data.settings.keep_on_top;
             let hotkey = data.settings.hotkey.clone();
-            let fences = data.fences.clone();
             let desktop = handle.path().desktop_dir().ok();
+            let store_root = std::env::var("MC_STORE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| handle.path().home_dir().unwrap_or_else(|_| PathBuf::from(".")).join("Mis Cercas"));
+            desk::unhide_legacy(&mut data);
+            desk::adopt(&mut data, desktop.clone(), &store_root, None);
+            let fences = data.fences.clone();
             app.manage(AppState {
                 dir,
                 desktop,
+                store: store_root,
                 data: Mutex::new(data),
                 dirty: AtomicBool::new(true),
                 icons: Mutex::new(HashMap::new()),

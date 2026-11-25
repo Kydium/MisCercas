@@ -191,13 +191,20 @@
     }
   }
 
-  async function loadIcon(el) {
+  async function loadIcon(el, attempt = 0) {
     const en = entries[Number(el.dataset.i)];
     if (!en) return;
     const url = await api.icon(en.path, S.settings.iconSize, en.isDir);
     if (url) iconCache.set(iconKey(en.path), url);
     const img = el.firstChild;
-    if (img && img.isConnected) { img.src = url || (en.isDir ? FALLBACK.dir : FALLBACK.file); img.classList.add('loaded'); }
+    if (img && img.isConnected) {
+      img.src = url || (en.isDir ? FALLBACK.dir : FALLBACK.file);
+      img.classList.add('loaded');
+      // a veces Windows tarda en dar el icono: se vuelve a intentar unas veces
+      if (!url && !en.missing && attempt < 4) {
+        setTimeout(() => { if (el.isConnected) loadIcon(el, attempt + 1); }, [600, 1500, 4000, 10000][attempt]);
+      }
+    }
   }
 
   /* ---------- selección y acciones ---------- */

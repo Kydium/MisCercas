@@ -182,6 +182,8 @@ pub fn get(path: &str, is_dir: bool) -> Option<String> {
     {
         let exists = std::fs::metadata(path).is_ok();
         let dir = if exists { std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(is_dir) } else { is_dir };
+        static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = GATE.lock().unwrap_or_else(|e| e.into_inner());
         win::shell_icon(path, dir, exists)
     }
     #[cfg(not(windows))]

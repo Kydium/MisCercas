@@ -61,39 +61,98 @@ mod attr {
     pub fn set_hidden(_p: &str, _h: bool) -> bool { false }
 }
 
-/// Oculta del Escritorio lo que está en una cerca normal y muestra de nuevo lo que ya no lo está.
-/// Solo se toca lo que ocultó esta aplicación. Devuelve true si cambió la lista.
-pub fn sync(data: &mut Data, user_desktop: Option<PathBuf>) -> bool {
+/// Versiones anteriores ocultaban los accesos con el atributo «oculto»: se vuelven a mostrar.
+pub fn unhide_legacy(data: &mut Data) {
+    for p in data.hidden.drain(..) {
+        if Path::new(&p).exists() {
+            attr::set_hidden(&p, false);
+        }
+    }
+}
+
+/* ---------- carpeta propia de Mis Cercas ---------- */
+fn folder_name(title: &str) -> String {
+    let cleaned: String = title.chars().map(|c| if "<>:\"/\\|?*".contains(c) || c.is_control() { '_' } else { c }).collect();
+    let t = cleaned.trim().trim_matches('.').trim().to_string();
+    let t: String = t.chars().take(60).collect();
+    if t.is_empty() { "Cerca".into() } else { t }
+}
+
+fn unique_in(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let p = Path::new(name);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    for n in 2..1000 {
+        let c = dir.join(format!("{stem} ({n}){ext}"));
+        if !c.exists() {
+            return c;
+        }
+    }
+    first
+}
+
+fn move_path(from: &Path, to_dir: &Path) -> Option<PathBuf> {
+    std::fs::create_dir_all(to_dir).ok()?;
+    let dest = unique_in(to_dir, from.file_name()?);
+    if std::fs::rename(from, &dest).is_ok() {
+        return Some(dest);
+    }
+    // otra unidad: se copia y luego se borra (solo archivos)
+    if from.is_file() && std::fs::copy(from, &dest).is_ok() {
+        if std::fs::remove_file(from).is_ok() {
+            return Some(dest);
+        }
+        let _ = std::fs::remove_file(&dest);
+    }
+    None
+}
+
+pub fn in_store(p: &str, store: &Path) -> bool {
+    let s = key(&store.to_string_lossy());
+    key(p).starts_with(&format!("{s}\\")) || key(p).starts_with(&format!("{s}/"))
+}
+
+/// Lo que se pone en una cerca desde el Escritorio se guarda en «Mis Cercas\<nombre de la cerca>».
+/// Devuelve los ids de las cercas que cambiaron.
+pub fn adopt(data: &mut Data, user_desktop: Option<PathBuf>, store: &Path, only: Option<&str>) -> Vec<String> {
+    let mut changed = vec![];
+    if !data.settings.hide_desktop {
+        return changed;
+    }
     let dirs = desktop_dirs(user_desktop);
-    let mut want: std::collections::HashMap<String, String> = Default::default();
-    if data.settings.hide_desktop {
-        for f in data.fences.iter().filter(|f| f.portal.is_none()) {
-            for it in &f.items {
-                if in_desktop(&it.p, &dirs) {
-                    want.insert(key(&it.p), it.p.clone());
+    for f in data.fences.iter_mut().filter(|f| f.portal.is_none() && only.map(|o| o == f.id).unwrap_or(true)) {
+        let dest = store.join(folder_name(&f.title));
+        let mut any = false;
+        for it in f.items.iter_mut() {
+            if in_desktop(&it.p, &dirs) && Path::new(&it.p).exists() {
+                if let Some(n) = move_path(Path::new(&it.p), &dest) {
+                    it.p = n.to_string_lossy().to_string();
+                    any = true;
                 }
             }
         }
-    }
-    let mut ours: Vec<String> = data.hidden.clone();
-    let before = ours.clone();
-    for (k, p) in &want {
-        if ours.iter().any(|o| key(o) == *k) || !Path::new(p).exists() || attr::is_hidden(p) {
-            continue;
-        }
-        if attr::set_hidden(p, true) {
-            ours.push(p.clone());
+        if any {
+            changed.push(f.id.clone());
         }
     }
-    ours.retain(|p| {
-        if want.contains_key(&key(p)) {
-            return true;
-        }
-        !(!Path::new(p).exists() || attr::set_hidden(p, false))
-    });
-    let changed = ours != before;
-    data.hidden = ours;
     changed
+}
+
+/// Devuelve un elemento de la carpeta de Mis Cercas al Escritorio. Da su nueva ruta.
+pub fn give_back(path: &str, store: &Path, user_desktop: Option<PathBuf>) -> Option<String> {
+    if !in_store(path, store) {
+        return None;
+    }
+    let desk = user_desktop?;
+    move_path(Path::new(path), &desk).map(|p| p.to_string_lossy().to_string())
+}
+
+pub fn fence_folder(store: &Path, title: &str) -> PathBuf {
+    store.join(folder_name(title))
 }
 
 /* ---------- «Mostrar escritorio» (Win+D) ---------- */
@@ -204,20 +263,71 @@ pub mod guard {
         }
     }
 
-    /// Sube las cercas al primer plano (aunque ya fueran «siempre encima» pero quedaran bajo el escritorio).
-    fn raise_all(app: &AppHandle, hs: Vec<isize>) {
+    fn diag(h: HWND) -> String {
+        unsafe {
+            let owner = GetWindow(h, GW_OWNER).map(|o| o.0 as isize).unwrap_or(0);
+            let mut cloaked: u32 = 0;
+            let _ = DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut std::ffi::c_void, 4);
+            format!(
+                "dueño={} estilo={:#x} estiloEx={:#x} oculta_por_dwm={} primer_plano={}",
+                owner,
+                GetWindowLongW(h, GWL_STYLE) as u32,
+                GetWindowLongW(h, GWL_EXSTYLE) as u32,
+                cloaked,
+                GetForegroundWindow() == h
+            )
+        }
+    }
+
+    /// Sube las cercas al primer plano. Si una se resiste (ya era «siempre encima» pero queda bajo el
+    /// escritorio) se prueban métodos cada vez más insistentes. Cada elemento: (ventana, intento).
+    fn raise_all(app: &AppHandle, hs: Vec<(isize, u32)>) {
         if hs.is_empty() {
             return;
         }
+        let hosts_now = hosts();
         let app2 = app.clone();
         let _ = app.run_on_main_thread(move || unsafe {
-            for h in hs {
+            for (h, attempt) in hs {
                 let h = HWND(h as *mut _);
-                if is_top(h) {
-                    let _ = SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, FLAGS);
+                if attempt >= 2 && attempt % 10 == 2 {
+                    log(&app2, format!("cerca resistente (intento {attempt}): {}", diag(h)));
                 }
-                if SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, FLAGS).is_err() {
-                    log(&app2, format!("SetWindowPos falló en {:?}: error {}", h.0, GetLastError().0));
+                match attempt {
+                    0 | 1 => {
+                        if is_top(h) {
+                            let _ = SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, FLAGS);
+                        }
+                        if SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, FLAGS).is_err() {
+                            log(&app2, format!("SetWindowPos falló en {:?}: error {}", h.0, GetLastError().0));
+                        }
+                    }
+                    2 | 3 => {
+                        let _ = SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, FLAGS);
+                        let _ = SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, FLAGS);
+                    }
+                    4 | 5 => {
+                        let _ = BringWindowToTop(h);
+                        let _ = SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, FLAGS);
+                    }
+                    n => {
+                        // último recurso: se oculta y se vuelve a mostrar para que Windows la coloque de nuevo
+                        if n % 8 == 6 {
+                            let _ = ShowWindow(h, SW_HIDE);
+                            let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+                        }
+                        let _ = SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, FLAGS);
+                        let _ = SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, FLAGS);
+                        // y, si aún hay un escritorio encima, justo por encima de él
+                        for host in hosts_now.iter() {
+                            let above = GetWindow(HWND(*host as *mut _), GW_HWNDPREV).unwrap_or_default();
+                            if above != h {
+                                let after = if above.0.is_null() { HWND_TOP } else { above };
+                                let _ = SetWindowPos(h, after, 0, 0, 0, 0, FLAGS);
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -269,6 +379,7 @@ pub mod guard {
                 return;
             };
             let mut raised = HashSet::<String>::new();
+            let mut attempts = std::collections::HashMap::<String, u32>::new();
             let mut shown_at: Option<Instant> = None;
             let mut sampled = 0u8;
             let mut off = 0;
@@ -299,6 +410,7 @@ pub mod guard {
                     if shown_at.is_none() {
                         shown_at = Some(Instant::now());
                         sampled = 0;
+                        attempts.clear();
                         log(&app, format!("escritorio encima; {}", states(&app)));
                     }
                     if hidden_by_user {
@@ -308,7 +420,9 @@ pub mod guard {
                     for w in crate::fence_windows(&app) {
                         if let Some(h) = raw(&w) {
                             if !is_top(h) || host_above(h, &hs) {
-                                todo.push(h.0 as isize);
+                                let n = attempts.entry(w.label().to_string()).or_insert(0);
+                                todo.push((h.0 as isize, *n));
+                                *n += 1;
                                 raised.insert(w.label().to_string());
                             }
                         }
@@ -349,4 +463,42 @@ pub mod guard {
 #[cfg(not(windows))]
 pub mod guard {
     pub fn start(_app: tauri::AppHandle) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store;
+
+    #[test]
+    fn mueve_a_la_carpeta_de_la_cerca_y_devuelve() {
+        let base = std::env::temp_dir().join(format!("mc-test-{}", std::process::id()));
+        let desktop = base.join("Desktop");
+        let store_dir = base.join("Mis Cercas");
+        std::fs::create_dir_all(&desktop).unwrap();
+        std::fs::write(desktop.join("a.txt"), "x").unwrap();
+        std::fs::write(desktop.join("b.txt"), "y").unwrap();
+        let mut data = store::normalize(&serde_json::Value::Null);
+        let mut f = store::sanitize_fence(&serde_json::json!({ "title": "Juegos: *" }));
+        f.items = vec![
+            store::Item { p: desktop.join("a.txt").to_string_lossy().to_string(), n: None },
+            store::Item { p: desktop.join("b.txt").to_string_lossy().to_string(), n: None },
+        ];
+        let id = f.id.clone();
+        data.fences = vec![f];
+        let changed = adopt(&mut data, Some(desktop.clone()), &store_dir, None);
+        assert_eq!(changed, vec![id]);
+        let p = data.fences[0].items[0].p.clone();
+        assert!(Path::new(&p).exists() && in_store(&p, &store_dir));
+        assert!(!desktop.join("a.txt").exists());
+        assert!(p.contains("Juegos_ _"), "{p}");
+        let back = give_back(&p, &store_dir, Some(desktop.clone())).unwrap();
+        assert!(Path::new(&back).exists() && desktop.join("a.txt").exists());
+        // un nombre repetido no pisa nada
+        std::fs::write(desktop.join("b.txt"), "z").unwrap();
+        let q = data.fences[0].items[1].p.clone();
+        let b2 = give_back(&q, &store_dir, Some(desktop.clone())).unwrap();
+        assert!(b2.contains("b (2).txt"), "{b2}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
